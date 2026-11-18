@@ -1,0 +1,228 @@
+name: Fixed synthetic cgroup cleanup
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Fixed synthetic experiment with outer watchdog
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d /tmp/astra-cgroup.XXXXXXXX)
+          trap 'rm -rf -- "$work"' EXIT
+          cat > "$work/synthetic.py" <<'PYTHON'
+          #!/usr/bin/env python3
+          """Fixed synthetic cgroup-v2 cleanup experiment, NOT a sandbox or engine runner.
+          
+          Only execute on a disposable CI VM under a separate hard timeout. No arbitrary
+          commands, paths or input are accepted. Never alter the existing cgroup parent.
+          """
+          import json
+          import os
+          import selectors
+          import signal
+          import subprocess
+          import sys
+          import time
+          
+          LIMIT = 32768
+          CASE_SECONDS = 2.0
+          CLEAN_SECONDS = 2.0
+          CASES = ('setsid', 'flood', 'deadline')
+          
+          
+          def child(case):
+              # Trusted fixed code; fork occurs only after host enrollment handshake.
+              if case not in CASES or os.read(0, 1) != b'G':
+                  os._exit(71)
+              os.write(1, ('leader %d\n' % os.getpid()).encode())
+              for name in ('ordinary', 'setsid'):
+                  pid = os.fork()
+                  if pid == 0:
+                      if name == 'setsid':
+                          os.setsid()
+                      os.write(1, ('%s %d\n' % (name, os.getpid())).encode())
+                      while True:
+                          time.sleep(1)
+              if case == 'flood':
+                  # Deliberately flood both pipes after both descendants exist.
+                  time.sleep(.1)
+                  while True:
+                      os.write(1, b'x' * 4096)
+                      os.write(2, b'y' * 4096)
+              while True:
+                  time.sleep(1)
+          
+          
+          def current_parent():
+              if os.geteuid() != 0:
+                  raise RuntimeError('root_required')
+              if not os.path.isfile('/sys/fs/cgroup/cgroup.controllers'):
+                  raise RuntimeError('cgroup_v2_required')
+              rows = open('/proc/self/cgroup', encoding='ascii').read().splitlines()
+              paths = [row[3:] for row in rows if row.startswith('0::/')]
+              if len(paths) != 1:
+                  raise RuntimeError('cgroup_membership_unknown')
+              parts = paths[0].split('/')
+              if any(part in ('.', '..') for part in parts):
+                  raise RuntimeError('invalid_membership_path')
+              return '/sys/fs/cgroup' + paths[0]
+          
+          
+          def put(group, name, value):
+              with open(os.path.join(group, name), 'w', encoding='ascii') as f:
+                  f.write(value)
+          
+          
+          def get(group, name):
+              with open(os.path.join(group, name), encoding='ascii') as f:
+                  return f.read()
+          
+          
+          def populated(group):
+              vals = [s.split() for s in get(group, 'cgroup.events').splitlines()]
+              rows = [v[1] for v in vals if len(v) == 2 and v[0] == 'populated']
+              if len(rows) != 1 or rows[0] not in ('0', '1'):
+                  raise RuntimeError('events_invalid')
+              return rows[0] == '1'
+          
+          
+          def observe(p, case, deadline):
+              selector = selectors.DefaultSelector()
+              data = bytearray()
+              stdout_data = bytearray()
+              seen = {}
+              try:
+                  for f in (p.stdout, p.stderr):
+                      os.set_blocking(f.fileno(), False)
+                      selector.register(f, selectors.EVENT_READ)
+                  while time.monotonic() < deadline:
+                      if p.poll() is not None:
+                          return 'child_exited', seen
+                      for key, _ in selector.select(min(.05, max(0, deadline-time.monotonic()))):
+                          chunk = os.read(key.fd, 4096)
+                          if not chunk:
+                              selector.unregister(key.fileobj)
+                              continue
+                          if len(data) + len(chunk) > LIMIT:
+                              return 'output_limit', seen
+                          data.extend(chunk)
+                          if key.fileobj is p.stdout:
+                              # Maintain separate streams: stderr interleaving must not alter markers.
+                              stdout_data.extend(chunk)
+                              for line in bytes(stdout_data).split(b'\n')[:-1]:
+                                  fields = line.split()
+                                  if len(fields) == 2 and fields[0] in (b'leader', b'ordinary', b'setsid') and fields[1].isdigit():
+                                      seen[fields[0].decode()] = int(fields[1])
+                          if case == 'setsid' and len(seen) == 3:
+                              return 'ready', seen
+                  return 'deadline', seen
+              finally:
+                  selector.close()
+          
+          
+          def scenario(parent, case):
+              # Unique group, exclusive mkdir; never signal or delete parent/siblings.
+              import secrets
+              group = os.path.join(parent, 'astra-synthetic-' + secrets.token_hex(12))
+              os.mkdir(group, 0o700)
+              p = None
+              result = {'case': case, 'engine_launch_authorized': False, 'pass': False}
+              cleanup_errors = []
+              try:
+                  if not os.path.isfile(os.path.join(group, 'cgroup.kill')):
+                      raise RuntimeError('cgroup_kill_unavailable')
+                  p = subprocess.Popen([sys.executable, '-I', os.path.abspath(__file__), '--child', case],
+                                       cwd='/', env={'PATH': '/usr/bin:/bin', 'LANG': 'C'},
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       close_fds=True, start_new_session=True)
+                  put(group, 'cgroup.procs', str(p.pid))
+                  if str(p.pid) not in get(group, 'cgroup.procs').split():
+                      raise RuntimeError('enrollment_not_observed')
+                  if not populated(group):
+                      raise RuntimeError('not_populated_after_enrollment')
+                  p.stdin.write(b'G'); p.stdin.flush(); p.stdin.close()
+                  status, seen = observe(p, case, time.monotonic() + CASE_SECONDS)
+                  members = set(get(group, 'cgroup.procs').split())
+                  all_members = len(seen) == 3 and len(set(seen.values())) == 3 and all(str(v) in members for v in seen.values()) and seen.get('leader') == p.pid
+                  try:
+                      escaped_session = all_members and os.getsid(seen['setsid']) == seen['setsid'] and os.getsid(seen['ordinary']) != seen['setsid']
+                  except (OSError, KeyError):
+                      escaped_session = False
+                  result.update(observation=status, markers=sorted(seen), all_three_observed_in_group=all_members,
+                                distinct_setsid_observed=escaped_session, populated_before_kill=populated(group))
+                  expected = {'setsid': 'ready', 'flood': 'output_limit', 'deadline': 'deadline'}[case]
+                  result['scenario_ok'] = status == expected and all_members and escaped_session and result['populated_before_kill']
+              except Exception as e:
+                  result['error'] = type(e).__name__ + ':' + str(e)[:100]
+              finally:
+                  # Always kill only our new group, even after partial startup or errors.
+                  try:
+                      put(group, 'cgroup.kill', '1')
+                      end = time.monotonic() + CLEAN_SECONDS
+                      while populated(group) and time.monotonic() < end:
+                          time.sleep(.02)
+                      result['empty_observed'] = not populated(group)
+                      if not result['empty_observed']:
+                          cleanup_errors.append('still_populated')
+                  except Exception as e:
+                      cleanup_errors.append('kill_or_empty:' + type(e).__name__)
+                  if p is not None:
+                      # If enrollment failed the blocked child can remain outside our group.
+                      try:
+                          if p.poll() is None:
+                              p.kill()
+                          p.wait(timeout=1)
+                          result['direct_child_reaped'] = True
+                      except Exception as e:
+                          cleanup_errors.append('direct_reap:' + type(e).__name__)
+                      for stream in (p.stdin, p.stdout, p.stderr):
+                          if stream is not None:
+                              try:
+                                  stream.close()
+                              except Exception as e:
+                                  # An IO close failure must not skip the subgroup removal attempt.
+                                  cleanup_errors.append('stream_close:' + type(e).__name__)
+                  try:
+                      os.rmdir(group)
+                      result['group_removed'] = True
+                  except OSError as e:
+                      cleanup_errors.append('rmdir:' + str(e.errno))
+                  result['cleanup_errors'] = cleanup_errors
+              result['pass'] = bool(result.get('scenario_ok') and result.get('empty_observed') and
+                                    result.get('direct_child_reaped') and result.get('group_removed') and not cleanup_errors)
+              return result
+          
+          
+          def main():
+              if len(sys.argv) == 3 and sys.argv[1] == '--child' and sys.argv[2] in CASES:
+                  child(sys.argv[2]); return 71
+              if len(sys.argv) != 1:
+                  print('fixed synthetic test only', file=sys.stderr); return 2
+              report = {'engine_launch_authorized': False, 'synthetic_only': True, 'results': []}
+              try:
+                  parent = current_parent()
+                  for case in CASES:
+                      r = scenario(parent, case)
+                      report['results'].append(r)
+                      if not r['pass']:
+                          break
+                  report['pass'] = len(report['results']) == len(CASES) and all(r['pass'] for r in report['results'])
+              except Exception as e:
+                  report['pass'] = False
+                  report['error'] = type(e).__name__ + ':' + str(e)[:100]
+              print(json.dumps(report, sort_keys=True), flush=True)
+              return 0 if report['pass'] else 1
+          
+          
+          if __name__ == '__main__':
+              sys.exit(main())
+          PYTHON
+          sha256sum "$work/synthetic.py"
+          # timeout and its process-group signals are external to the monitor;
+          # escaped synthetic descendants rely on GitHub-hosted VM disposal.
+          sudo -n timeout --signal=TERM --kill-after=3s 25s env -i PATH=/usr/bin:/bin LANG=C python3 -I "$work/synthetic.py"
