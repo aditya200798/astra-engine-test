@@ -1,0 +1,169 @@
+name: Fixed boundary and lease synthetic probe
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Disposable boundary and lease probe
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          cat > /tmp/astra-boundary-probe.py <<'PROBE'
+          #!/usr/bin/python3
+          """Fixed disposable CI probe, synthetic only. Never starts an engine."""
+          import errno, json, os, selectors, socket, subprocess, sys, time
+          
+          ENV = {'PATH': '/usr/bin:/bin', 'HOME': '/work/home', 'TMPDIR': '/work/tmp', 'LANG': 'C'}
+          
+          def server():
+              s = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen(1); s.settimeout(3)
+              pid = os.fork()
+              if pid == 0:
+                  os.setsid()
+                  f = os.open('/dev/null', os.O_RDWR)
+                  for n in (0, 1, 2): os.dup2(f, n)
+                  while True: time.sleep(1)
+              print(json.dumps({'url':'http://127.0.0.1:%d' % s.getsockname()[1], 'descendant':pid}), flush=True)
+              conn, _ = s.accept()
+              with conn:
+                  conn.settimeout(2)
+                  assert conn.recv(1) == b'A'
+                  conn.sendall(b'B')
+              assert sys.stdin.buffer.read(1) == b''
+              s.close()
+          
+          
+          def route(family, kind, addr):
+              try:
+                  with socket.socket(family, kind) as s:
+                      s.settimeout(.5); s.connect(addr)
+                  return 'connected'
+              except OSError as e:
+                  return 'errno:%s' % e.errno
+          
+          
+          def driver():
+              checks = {}
+              status = {}
+              for line in open('/proc/self/status'):
+                  if ':' in line:
+                      k, v = line.split(':', 1); status[k] = v.strip()
+              checks['env_exact'] = dict(os.environ) == ENV
+              checks['uid_nonroot'] = os.getuid() == 65534 and os.getgid() == 65534
+              checks['no_caps_nnp'] = all(int(status.get(x, '1'), 16) == 0 for x in ('CapEff', 'CapPrm', 'CapInh', 'CapAmb')) and status.get('NoNewPrivs') == '1'
+              checks['host_paths_hidden'] = not os.path.exists('/tmp/astra-boundary-host-sentinel') and not os.path.exists('/root') and not os.path.exists('/run') and not os.path.exists('/home/runner')
+              checks['home_clean'] = os.listdir('/work/home') == [] and os.listdir('/work/tmp') == []
+              checks['host_etc_hidden'] = not os.path.exists('/etc/passwd')
+              checks['network'] = {str(x) for _, x in socket.if_nameindex()} == {'lo'}
+              checks['routes'] = all(route(*args) == 'errno:%s' % errno.ENETUNREACH for args in [
+                  (socket.AF_INET, socket.SOCK_DGRAM, ('192.0.2.53',53)),
+                  (socket.AF_INET6, socket.SOCK_DGRAM, ('2001:db8::53',53)),
+                  (socket.AF_INET, socket.SOCK_STREAM, ('192.0.2.1',9)),
+                  (socket.AF_INET6, socket.SOCK_STREAM, ('2001:db8::1',9))])
+              fds = []
+              for n in os.listdir('/proc/self/fd'):
+                  try: os.readlink('/proc/self/fd/' + n); fds.append(int(n))
+                  except FileNotFoundError: pass
+              checks['fds_only_stdio'] = sorted(fds) == [0,1,2]
+              p = subprocess.Popen([sys.executable, '-I', '/probe.py', '--server'], env=ENV,
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True)
+              try:
+                  sel = selectors.DefaultSelector()
+                  sel.register(p.stdout, selectors.EVENT_READ); sel.register(p.stderr, selectors.EVENT_READ)
+                  deadline = time.monotonic() + 4; buf = bytearray(); err = bytearray()
+                  while b'\n' not in buf and time.monotonic() < deadline:
+                      for key, _ in sel.select(max(0, deadline-time.monotonic())):
+                          chunk = os.read(key.fd, 4096)
+                          if not chunk: raise RuntimeError('premature_eof')
+                          target = buf if key.fileobj is p.stdout else err
+                          target.extend(chunk)
+                          if len(buf) + len(err) > 8192: raise RuntimeError('output_limit')
+                  sel.close()
+                  if not buf.endswith(b'\n') or buf.count(b'\n') != 1: raise RuntimeError('lease_format')
+                  record = json.loads(buf); url = record['url']; prefix = 'http://127.0.0.1:'
+                  if not url.startswith(prefix) or not url[len(prefix):].isdigit(): raise RuntimeError('lease_url')
+                  port = int(url[len(prefix):]); assert 1 <= port <= 65535
+                  with socket.create_connection(('127.0.0.1', port), timeout=2) as c:
+                      c.sendall(b'A'); checks['loopback_exchange'] = c.recv(1) == b'B'
+                  p.stdin.close(); p.wait(timeout=3)
+                  checks['lease_close_exits_server'] = p.returncode == 0
+                  checks['descendant_setsess'] = os.getsid(record['descendant']) == record['descendant']
+              finally:
+                  if p.poll() is None: p.kill(); p.wait(timeout=2)
+                  for f in (p.stdin, p.stdout, p.stderr):
+                      if f and not f.closed: f.close()
+              result = {'synthetic_only': True, 'engine_launch_authorized': False, 'checks':checks, 'pass': all(checks.values())}
+              print(json.dumps(result, sort_keys=True), flush=True)
+              if not result['pass']: return 1
+              # Stay alive with the setsid descendant until the host kills the cgroup.
+              while True: time.sleep(1)
+          
+          if __name__ == '__main__':
+              if sys.argv[1:] == ['--server']: server()
+              elif sys.argv[1:] == []: sys.exit(driver())
+              else: sys.exit(2)
+          PROBE
+          cat > /tmp/astra-boundary-host.py <<'HOST'
+          #!/usr/bin/python3
+          """Synthetic boundary probe host supervisor: isolated disposable CI VM only."""
+          import json, os, selectors, subprocess, sys, tempfile, time
+          from pathlib import Path
+          
+          def main():
+              parent = '/sys/fs/cgroup' + next(x[3:] for x in Path('/proc/self/cgroup').read_text().splitlines() if x.startswith('0::/'))
+              group = tempfile.mkdtemp(prefix='astra-boundary-', dir=parent)
+              p = None; result = {'synthetic_only':True, 'engine_launch_authorized':False, 'pass':False}; errors=[]
+              try:
+                  # Shell blocks until membership is confirmed; no fork before enrollment.
+                  command = ['/bin/sh', '-c', 'IFS= read -r go; [ "$go" = GO ] || exit 9; exec /usr/bin/unshare -n /bin/sh -c "ip link set lo up && exec bwrap --unshare-pid --unshare-ipc --unshare-uts --die-with-parent --ro-bind /usr/bin /usr/bin --ro-bind /usr/lib /usr/lib --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --dir /usr/lib64 --dir /etc --ro-bind /etc/ld.so.cache /etc/ld.so.cache --tmpfs /work --dir /work/home --dir /work/tmp --dev /dev --proc /proc --ro-bind /tmp/astra-boundary-probe.py /probe.py --chdir /work --clearenv --setenv PATH /usr/bin:/bin --setenv HOME /work/home --setenv TMPDIR /work/tmp --setenv LANG C -- /usr/bin/setpriv --reuid 65534 --regid 65534 --clear-groups --no-new-privs /usr/bin/python3 -I /probe.py"']
+                  p = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       env={'PATH':'/usr/bin:/bin', 'SYNTHETIC_SECRET':'not-a-real-secret'}, close_fds=True, start_new_session=True)
+                  Path(group+'/cgroup.procs').write_text(str(p.pid))
+                  if str(p.pid) not in Path(group+'/cgroup.procs').read_text().split(): raise RuntimeError('enrollment_failed')
+                  p.stdin.write(b'GO\n'); p.stdin.flush(); p.stdin.close(); p.stdin=None
+                  sel = selectors.DefaultSelector(); out=bytearray(); err=bytearray()
+                  for f in (p.stdout, p.stderr):
+                      os.set_blocking(f.fileno(), False); sel.register(f, selectors.EVENT_READ)
+                  deadline = time.monotonic()+12
+                  while b'\n' not in out and time.monotonic()<deadline:
+                      events=sel.select(min(.1, max(0,deadline-time.monotonic())))
+                      for key, _ in events:
+                          chunk=os.read(key.fd, 4096)
+                          if not chunk: sel.unregister(key.fileobj); continue
+                          (out if key.fileobj is p.stdout else err).extend(chunk)
+                          if len(out)+len(err)>16384: raise RuntimeError('output_excess')
+                      if p.poll() is not None and b'\n' not in out: break
+                  sel.close()
+                  result['stderr'] = err.decode('utf-8', 'replace')[-2000:]
+                  try: result['driver'] = json.loads(out)
+                  except ValueError: result['stdout_invalid'] = out.decode('utf-8', 'replace')[-2000:]
+                  if not result.get('driver'): raise RuntimeError('no_report')
+                  result['populated_before_cleanup'] = 'populated 1' in Path(group+'/cgroup.events').read_text()
+              except Exception as e: result['error'] = type(e).__name__+':'+str(e)[:200]
+              finally:
+                  try:
+                      Path(group+'/cgroup.kill').write_text('1')
+                      end=time.monotonic()+3
+                      while 'populated 1' in Path(group+'/cgroup.events').read_text() and time.monotonic()<end: time.sleep(.02)
+                      result['empty'] = 'populated 0' in Path(group+'/cgroup.events').read_text()
+                  except Exception as e: errors.append('kill:'+type(e).__name__)
+                  if p is not None:
+                      try:
+                          if p.poll() is None: p.kill()
+                          p.wait(timeout=2); result['reaped']=True
+                      except Exception as e: errors.append('reap:'+type(e).__name__)
+                  try: os.rmdir(group); result['removed']=True
+                  except OSError as e: errors.append('rmdir:'+str(e.errno))
+                  result['cleanup_errors']=errors
+              result['pass'] = bool(result.get('driver',{}).get('pass') and result.get('populated_before_cleanup') and result.get('empty') and result.get('reaped') and result.get('removed') and not errors)
+              print(json.dumps(result,sort_keys=True), flush=True)
+              return 0 if result['pass'] else 1
+          if __name__ == '__main__': sys.exit(main())
+          HOST
+          printf 'synthetic-only' > /tmp/astra-boundary-host-sentinel
+          sha256sum /tmp/astra-boundary-probe.py /tmp/astra-boundary-host.py
+          sudo -n timeout --signal=TERM --kill-after=3s 25s env -i PATH=/usr/bin:/bin LANG=C /usr/bin/python3 -I /tmp/astra-boundary-host.py
