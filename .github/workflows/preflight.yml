@@ -1,0 +1,42 @@
+name: Astra isolated preflight
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check filesystem and isolated network namespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -sm
+          df -h "$RUNNER_TEMP"
+          ulimit -f
+          python3 - <<'PY'
+          import os, tempfile
+          with tempfile.TemporaryFile(dir=os.environ['RUNNER_TEMP']) as f:
+              block = b'\0' * (1024 * 1024)
+              for _ in range(210):
+                  f.write(block)
+              f.flush()
+              print('FILE_WRITE_BYTES:', f.tell())
+          PY
+          sudo unshare --net bash -c 'ip link set lo up; python3 - <<"PY"
+          import socket
+          server = socket.socket()
+          server.bind(("127.0.0.1", 0))
+          server.listen(1)
+          client = socket.create_connection(server.getsockname(), timeout=2)
+          peer, _ = server.accept()
+          client.sendall(b"ASTRA_SYNTHETIC_TEST")
+          assert peer.recv(64) == b"ASTRA_SYNTHETIC_TEST"
+          print("LOOPBACK_EXCHANGE: PASS")
+          try:
+              socket.create_connection(("1.1.1.1", 443), timeout=2)
+          except OSError as exc:
+              print("EGRESS_PROBE_BLOCKED:", type(exc).__name__, exc.errno)
+          else:
+              raise SystemExit("EGRESS_PROBE_UNEXPECTEDLY_CONNECTED")
+          PY'
