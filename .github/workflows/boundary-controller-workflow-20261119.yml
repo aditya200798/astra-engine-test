@@ -5,11 +5,11 @@ permissions: {}
 jobs:
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 2
+    timeout-minutes: 3
     steps:
       - name: Disposable boundary and lease probe
         shell: bash
-        timeout-minutes: 1
+        timeout-minutes: 2
         run: |
           set -euo pipefail
           cat > /tmp/astra-boundary-probe.py <<'PROBE'
@@ -119,7 +119,7 @@ jobs:
               p = None; result = {'synthetic_only':True, 'engine_launch_authorized':False, 'pass':False}; errors=[]
               try:
                   # Shell blocks until membership is confirmed; no fork before enrollment.
-                  command = ['/bin/sh', '-c', 'IFS= read -r go; [ "$go" = GO ] || exit 9; exec /usr/bin/unshare -n /bin/sh -c "ip link set lo up && exec bwrap --unshare-pid --unshare-ipc --unshare-uts --die-with-parent --ro-bind /usr/bin /usr/bin --ro-bind /usr/lib /usr/lib --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --dir /usr/lib64 --dir /etc --ro-bind /etc/ld.so.cache /etc/ld.so.cache --tmpfs /work --dir /work/home --dir /work/tmp --dev /dev --proc /proc --ro-bind /tmp/astra-boundary-probe.py /probe.py --chdir /work --clearenv --setenv PATH /usr/bin:/bin --setenv HOME /work/home --setenv TMPDIR /work/tmp --setenv LANG C -- /usr/bin/setpriv --reuid 65534 --regid 65534 --clear-groups --no-new-privs /usr/bin/python3 -I /probe.py"']
+                  command = ['/bin/sh', '-c', 'IFS= read -r go; [ "$go" = GO ] || exit 9; exec /usr/bin/unshare -n /bin/sh -c "ip link set lo up && exec bwrap --unshare-pid --unshare-ipc --unshare-uts --die-with-parent --ro-bind /usr/bin /usr/bin --ro-bind /usr/lib /usr/lib --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --dir /usr/lib64 --dir /etc --ro-bind /etc/ld.so.cache /etc/ld.so.cache --tmpfs /work --dir /work/home --dir /work/tmp --chmod 0777 /work/home --chmod 0777 /work/tmp --dev /dev --proc /proc --ro-bind /tmp/astra-boundary-probe.py /probe.py --chdir /work --clearenv --setenv PATH /usr/bin:/bin --setenv HOME /work/home --setenv TMPDIR /work/tmp --setenv LANG C -- /usr/bin/setpriv --reuid 65534 --regid 65534 --clear-groups --no-new-privs /usr/bin/python3 -I /probe.py"']
                   p = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                        env={'PATH':'/usr/bin:/bin', 'SYNTHETIC_SECRET':'not-a-real-secret'}, close_fds=True, start_new_session=True)
                   Path(group+'/cgroup.procs').write_text(str(p.pid))
@@ -166,4 +166,5 @@ jobs:
           HOST
           printf 'synthetic-only' > /tmp/astra-boundary-host-sentinel
           sha256sum /tmp/astra-boundary-probe.py /tmp/astra-boundary-host.py
+          if ! command -v bwrap >/dev/null; then sudo -n apt-get update -qq && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends bubblewrap; fi
           sudo -n timeout --signal=TERM --kill-after=3s 25s env -i PATH=/usr/bin:/bin LANG=C /usr/bin/python3 -I /tmp/astra-boundary-host.py
