@@ -17,7 +17,20 @@ jobs:
           """Fixed disposable CI probe, synthetic only. Never starts an engine."""
           import errno, json, os, selectors, socket, subprocess, sys, time
           
-          ENV = {'PATH': '/usr/bin:/bin', 'HOME': '/work/home', 'TMPDIR': '/work/tmp', 'LANG': 'C'}
+          ENV = {'PATH': '/usr/bin:/bin', 'HOME': '/work/home', 'TMPDIR': '/work/tmp', 'LANG': 'C', 'LC_ALL': 'C'}
+          
+          
+          def env_diagnostic(environ):
+              # Never log unknown names or any values. Locale coercion is a known hypothesis.
+              return {'exact': dict(environ) == ENV,
+                      'expected_match': {key: environ.get(key) == value for key, value in ENV.items()},
+                      'unexpected_count': len(set(environ) - set(ENV)),
+                      'lc_ctype_present': 'LC_CTYPE' in environ}
+          
+          
+          def env_gate(environ):
+              diagnostic = env_diagnostic(environ)
+              return diagnostic['exact'], diagnostic
           
           def server():
               s = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen(1); s.settimeout(3)
@@ -52,7 +65,7 @@ jobs:
               for line in open('/proc/self/status'):
                   if ':' in line:
                       k, v = line.split(':', 1); status[k] = v.strip()
-              checks['env_exact'] = dict(os.environ) == ENV
+              checks['env_exact'], env_report = env_gate(os.environ)
               checks['uid_nonroot'] = os.getuid() == 65534 and os.getgid() == 65534
               checks['no_caps_nnp'] = all(int(status.get(x, '1'), 16) == 0 for x in ('CapEff', 'CapPrm', 'CapInh', 'CapAmb')) and status.get('NoNewPrivs') == '1'
               checks['host_paths_hidden'] = not os.path.exists('/tmp/astra-boundary-host-sentinel') and not os.path.exists('/root') and not os.path.exists('/run') and not os.path.exists('/home/runner')
@@ -96,7 +109,7 @@ jobs:
                   if p.poll() is None: p.kill(); p.wait(timeout=2)
                   for f in (p.stdin, p.stdout, p.stderr):
                       if f and not f.closed: f.close()
-              result = {'synthetic_only': True, 'engine_launch_authorized': False, 'checks':checks, 'pass': all(checks.values())}
+              result = {'synthetic_only': True, 'engine_launch_authorized': False, 'checks':checks, 'environment_diagnostic':env_report, 'pass': all(checks.values())}
               print(json.dumps(result, sort_keys=True), flush=True)
               if not result['pass']: return 1
               # Stay alive with the setsid descendant until the host kills the cgroup.
@@ -119,7 +132,7 @@ jobs:
               p = None; result = {'synthetic_only':True, 'engine_launch_authorized':False, 'pass':False}; errors=[]
               try:
                   # Shell blocks until membership is confirmed; no fork before enrollment.
-                  command = ['/bin/sh', '-c', 'IFS= read -r go; [ "$go" = GO ] || exit 9; exec /usr/bin/unshare -n /bin/sh -c "ip link set lo up && exec bwrap --unshare-pid --unshare-ipc --unshare-uts --die-with-parent --chmod 0755 / --dir /usr --chmod 0755 /usr --ro-bind /usr/bin /usr/bin --ro-bind /usr/lib /usr/lib --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --ro-bind /usr/lib64 /usr/lib64 --dir /etc --ro-bind /etc/ld.so.cache /etc/ld.so.cache --tmpfs /work --dir /work/home --dir /work/tmp --chmod 0777 /work/home --chmod 0777 /work/tmp --dev /dev --proc /proc --ro-bind /tmp/astra-boundary-probe.py /probe.py --chdir /work --clearenv --setenv PATH /usr/bin:/bin --setenv HOME /work/home --setenv TMPDIR /work/tmp --setenv LANG C -- /usr/bin/setpriv --reuid 65534 --regid 65534 --clear-groups --no-new-privs /usr/bin/python3 -I /probe.py"']
+                  command = ['/bin/sh', '-c', 'IFS= read -r go; [ "$go" = GO ] || exit 9; exec /usr/bin/unshare -n /bin/sh -c "ip link set lo up && exec bwrap --unshare-pid --unshare-ipc --unshare-uts --die-with-parent --chmod 0755 / --dir /usr --chmod 0755 /usr --ro-bind /usr/bin /usr/bin --ro-bind /usr/lib /usr/lib --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --ro-bind /usr/lib64 /usr/lib64 --dir /etc --ro-bind /etc/ld.so.cache /etc/ld.so.cache --tmpfs /work --dir /work/home --dir /work/tmp --chmod 0777 /work/home --chmod 0777 /work/tmp --dev /dev --proc /proc --ro-bind /tmp/astra-boundary-probe.py /probe.py --chdir /work --clearenv --setenv PATH /usr/bin:/bin --setenv HOME /work/home --setenv TMPDIR /work/tmp --setenv LANG C --setenv LC_ALL C -- /usr/bin/setpriv --reuid 65534 --regid 65534 --clear-groups --no-new-privs /usr/bin/env -i PATH=/usr/bin:/bin HOME=/work/home TMPDIR=/work/tmp LANG=C LC_ALL=C /usr/bin/python3 -I /probe.py"']
                   p = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                        env={'PATH':'/usr/bin:/bin', 'SYNTHETIC_SECRET':'not-a-real-secret'}, close_fds=True, start_new_session=True)
                   Path(group+'/cgroup.procs').write_text(str(p.pid))
