@@ -1,0 +1,73 @@
+name: Synthetic bounded checks
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Synthetic capacity
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          uname -a
+          timeout 90s python3 - <<'PY'
+          import hashlib, os, resource, tempfile, json
+          size=260*1024*1024
+          h=hashlib.sha256(); d=os.environ['RUNNER_TEMP']; v=os.statvfs(d)
+          with tempfile.TemporaryFile(dir=d) as f:
+              for n in range(260):
+                  b=hashlib.shake_256(('synthetic-'+str(n)).encode()).digest(1024*1024)
+                  f.write(b); h.update(b)
+              f.flush(); os.fsync(f.fileno()); s=os.fstat(f.fileno()); f.seek(0); r=hashlib.sha256()
+              while True:
+                  b=f.read(1024*1024)
+                  if not b: break
+                  r.update(b)
+              ok=s.st_size==size and s.st_blocks*512>=size and h.digest()==r.digest()
+              print(json.dumps({'bytes':s.st_size,'allocated':s.st_blocks*512,'free_before':v.f_bavail*v.f_frsize,'rlimit':resource.getrlimit(resource.RLIMIT_FSIZE),'roundtrip':h.digest()==r.digest(),'pass':ok}))
+              if not ok: raise SystemExit(1)
+          PY
+      - name: Synthetic network namespace
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          timeout 35s sudo unshare --net -- bash -c '
+          set -euo pipefail
+          ip link set lo up
+          ip -j link show
+          ip -j addr show
+          ip -j -4 route show table all
+          ip -j -6 route show table all
+          python3 - <<"PY"
+          import errno,json,socket,subprocess
+          links=json.loads(subprocess.check_output(["ip","-j","link","show"]))
+          assert [x["ifname"] for x in links]==["lo"]
+          a=socket.socket(); a.settimeout(3); a.bind(("127.0.0.1",0)); a.listen(1)
+          b=socket.create_connection(a.getsockname(),timeout=3); c,_=a.accept(); c.settimeout(3)
+          b.sendall(b"a"); assert c.recv(1)==b"a"; c.sendall(b"b"); assert b.recv(1)==b"b"
+          a.close(); b.close(); c.close(); out={}
+          for family,addr in [(socket.AF_INET,("192.0.2.1",9)),(socket.AF_INET6,("2001:db8::1",9))]:
+              for typ in [socket.SOCK_STREAM,socket.SOCK_DGRAM]:
+                  s=socket.socket(family,typ); s.settimeout(2); key=("v4" if family==socket.AF_INET else "v6")+("_tcp" if typ==socket.SOCK_STREAM else "_udp")
+                  try: s.connect(addr); out[key]="connected"
+                  except OSError as e: out[key]=e.errno
+                  finally: s.close()
+          ok=all(x in (errno.ENETUNREACH,errno.EHOSTUNREACH) for x in out.values())
+          print(json.dumps({"loopback_roundtrip":True,"route_probes":out,"pass":ok}))
+          if not ok: raise SystemExit(1)
+          PY
+          '
+      - name: Cgroup v2 availability only
+        timeout-minutes: 1
+        run: |
+          timeout 10s python3 - <<'PY'
+          import json,os
+          line=next((s.strip() for s in open('/proc/self/cgroup') if s.startswith('0::')),None)
+          root='/sys/fs/cgroup'; path=os.path.realpath(root+'/'+(line.split('::',1)[1].lstrip('/') if line else ''))
+          print(json.dumps({'v2':line is not None,'own_cgroup':line,'parent_path_valid':os.path.commonpath([root,path])==root,'writable':os.access(path,os.W_OK),'cgroup_kill_present':os.path.exists(path+'/cgroup.kill'),'cleanup_test':'not_run','engine_launch_authorized':False}))
+          PY
+      - name: Limitations
+        if: always()
+        run: echo 'Synthetic diagnostics only; engine_launch_authorized=false; no engine, provider, personal data, artifacts or secrets. Not a sandbox or cleanup certification.'
