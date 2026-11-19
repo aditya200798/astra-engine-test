@@ -1,0 +1,97 @@
+name: Synthetic no-engine CI candidate - DISABLED
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: astra-synthetic-ci-shared
+  cancel-in-progress: false
+jobs:
+  baseline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7
+    steps:
+      - name: Fixed immutable artifact checkout - disabled
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: aditya200798/astra-engine-test
+          ref: '4869c2bec4be359e90b1a8517cfda2a91bba0e00'
+          path: astra-synthetic-ci-input
+          persist-credentials: false
+          fetch-depth: 1
+          sparse-checkout: ci-no-engine-diagnostic-bundle-20261119.tar.gz
+          sparse-checkout-cone-mode: false
+          lfs: false
+          submodules: false
+      - name: Fixed synthetic no-engine control - disabled
+        shell: bash
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          test "${RUNNER_ENVIRONMENT:-}" = github-hosted
+          test "${RUNNER_OS:-}" = Linux
+          test "${GITHUB_REPOSITORY:-}" = aditya200798/astra-engine-test
+          test "${GITHUB_EVENT_NAME:-}" = workflow_dispatch
+          test "$(nproc)" -ge 2
+          sudo -n true
+          # Fixed root-owned destination; source uses one open FD and is hash-checked
+          # BEFORE any archive parsing or invocation of its contents.
+          sudo -n /usr/bin/python3 -I - "$GITHUB_WORKSPACE" <<'ASTRA_PRIVILEGED_SETUP'
+          import hashlib,os,re,stat,sys
+          if len(sys.argv)!=2:raise ValueError('workspace argument')
+          source=sys.argv[1]
+          # Fixed documented runner directory grammar is checked before use; exact
+          # source bytes must pass the digest independently. Root/workspace trust is
+          # only a snapshot, not a claim against same-privilege writers or malicious VM.
+          if not re.fullmatch(r'/home/runner/work/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+',source):raise ValueError('workspace unavailable')
+          if any(p in ('.','..') for p in source.split('/')):raise ValueError('workspace path')
+          source=os.path.join(source,'astra-synthetic-ci-input','ci-no-engine-diagnostic-bundle-20261119.tar.gz')
+          fd=os.open(source,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC|os.O_NONBLOCK)
+          try:
+           st=os.fstat(fd)
+           if not stat.S_ISREG(st.st_mode) or st.st_nlink!=1 or not 0<st.st_size<=16000000:raise ValueError('bundle metadata')
+           chunks=[];total=0
+           while total<=16000000:
+            b=os.read(fd,min(65536,16000001-total))
+            if not b:break
+            chunks.append(b);total+=len(b)
+           raw=b''.join(chunks)
+           if len(raw)!=st.st_size or hashlib.sha256(raw).hexdigest()!='dbbb07709c7a74fc3e8cd7ce0252d95ed2aff0e1bdeaff645985afd5d81c495d':raise ValueError('bundle digest')
+          finally:os.close(fd)
+          os.mkdir('/run/astra-synthetic-input',0o700);os.chmod('/run/astra-synthetic-input',0o700)
+          fd=os.open('/run/astra-synthetic-input/bundle.tar.gz',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o400)
+          try:
+           os.fchmod(fd,0o400);view=memoryview(raw)
+           while view:
+            n=os.write(fd,view)
+            if n<=0:raise ValueError('bundle write')
+            view=view[n:]
+           os.fsync(fd)
+          finally:os.close(fd)
+          bootstrap='#!/usr/bin/python3\n"""Fixed digest-pinned synthetic CI bundle extractor; candidate only.\n\nMust itself be pinned and reviewed before privileged execution. It receives no\npath arguments; writes only one new mode-0700 root directory. Does not run the\nbundle, manage cgroups or authorize CI. GitHub VM and no-concurrent-writer\nassumptions remain external. Never use with secrets, user data or real engine.\n"""\nimport hashlib, io, json, os, re, stat, sys, tarfile\n\nBUNDLE="/tmp/astra-synthetic-ci-bundle.tar.gz"\nDEST="/run/astra-synthetic-bundle"\nBUNDLE_SHA="dbbb07709c7a74fc3e8cd7ce0252d95ed2aff0e1bdeaff645985afd5d81c495d"\nMAX_BUNDLE=16_000_000\nMAX_TOTAL=12_000_000\nMAX_FILE=3_000_000\nPATH=re.compile(r"(?:astra|devtools)/[a-z0-9_]+\\.py|docs/ubuntu-runtime-manifest-20261119\\.json|docs/ubuntu-runtime-evidence-20261119/(?:download-list|extra-list|Packages\\.gz|BasePackages\\.gz)\\Z")\n\n\ndef _read_exact(fd,limit):\n    out=[];total=0\n    while total<=limit:\n        chunk=os.read(fd,min(65536,limit+1-total))\n        if not chunk:break\n        out.append(chunk);total+=len(chunk)\n    if total>limit:raise ValueError(\'too large\')\n    return b\'\'.join(out)\n\n\ndef _extract(bundle,dest,expected):\n    """Testable bounded extractor; paths/expected are not public CLI options.\n\n    Parent must be exclusively controlled. O_EXCL and O_NOFOLLOW avoid common\n    collisions, but are not a substitute for trusted parent or VM ownership.\n    On failure the partially created directory must not be reused.\n    """\n    fd=os.open(bundle,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC|os.O_NONBLOCK)\n    try:\n        before=os.fstat(fd)\n        if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1:raise ValueError(\'bundle file\')\n        raw=_read_exact(fd,MAX_BUNDLE)\n        if (len(raw)!=before.st_size or hashlib.sha256(raw).hexdigest()!=expected or\n            os.fstat(fd).st_mtime_ns!=before.st_mtime_ns):raise ValueError(\'bundle hash\')\n    finally:os.close(fd)\n    # Digest matches the entire pre-reviewed archive before decompression.\n    with tarfile.open(fileobj=io.BytesIO(raw),mode=\'r:gz\') as tar:\n        members=tar.getmembers()\n        if len(members)>128 or len(members)!=len({m.name for m in members}):raise ValueError(\'members\')\n        names={m.name for m in members}\n        if \'BUNDLE-MANIFEST.json\' not in names:raise ValueError(\'manifest\')\n        if any(not m.isfile() or m.size<0 or m.size>MAX_FILE for m in members):raise ValueError(\'member\')\n        meta=json.load(tar.extractfile(\'BUNDLE-MANIFEST.json\'))\n        if type(meta) is not dict or set(meta)!={\'schema\',\'files\'} or meta[\'schema\']!=\'astra-synthetic-no-engine-bundle-v1\' or type(meta[\'files\']) is not dict:\n            raise ValueError(\'manifest schema\')\n        files=meta[\'files\']\n        if set(files)!=names-{\'BUNDLE-MANIFEST.json\'} or sum(m.size for m in members)>MAX_TOTAL:raise ValueError(\'contents\')\n        payload={}\n        for name,info in files.items():\n            if not PATH.fullmatch(name) or type(info) is not dict or set(info)!={\'sha256\',\'size\'}:raise ValueError(\'filename\')\n            content=tar.extractfile(name).read(MAX_FILE+1)\n            if len(content)!=info[\'size\'] or hashlib.sha256(content).hexdigest()!=info[\'sha256\']:raise ValueError(\'digest\')\n            payload[name]=content\n    os.mkdir(dest,0o700)\n    os.chmod(dest,0o700)\n    for name,data in sorted(payload.items()):\n        directory,leaf=name.rsplit(\'/\',1)\n        current=dest\n        for part in directory.split(\'/\'):\n            current=os.path.join(current,part)\n            try:os.mkdir(current,0o700)\n            except FileExistsError:\n                s=os.lstat(current)\n                if not stat.S_ISDIR(s.st_mode) or s.st_uid!=os.geteuid():raise ValueError(\'directory\')\n        out=os.open(os.path.join(current,leaf),os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o400)\n        try:\n            os.fchmod(out,0o400);view=memoryview(data)\n            while view:\n                n=os.write(out,view)\n                if n<=0:raise ValueError(\'write\')\n                view=view[n:]\n            os.fsync(out)\n        finally:os.close(out)\n    return len(payload)\n\n\ndef main():\n    if len(sys.argv)!=1 or os.geteuid()!=0:raise ValueError(\'not fixed root invocation\')\n    n=_extract(BUNDLE,DEST,BUNDLE_SHA)\n    print(\'fixed_bundle=verified_extracted files=\'+str(n),flush=True)\nif __name__==\'__main__\':\n    try:main()\n    except Exception:\n        print(\'fixed_bundle=unknown\',flush=True);sys.exit(1)\n'
+          ns={'__name__':'astra_ci_inline_bootstrap'}
+          exec(compile(bootstrap,'<fixed synthetic bootstrap>','exec'),ns)
+          ns['BUNDLE']='/run/astra-synthetic-input/bundle.tar.gz'
+          if os.geteuid()!=0:raise ValueError('root required')
+          ns['_extract'](ns['BUNDLE'],ns['DEST'],ns['BUNDLE_SHA'])
+          raw=b'"""Fixed synthetic CI delegated-scope adapter, candidate only.\n\nRuns only when a separately reviewed workflow creates a standard disposable VM\nand authenticates the complete bundle before executing any privileged code.\nOne baseline, no command arguments except the exact systemd scope identifier.\nNever run on Android, shared hosts, with a real engine, model or secrets.\nNo output claims sandboxing, full process cleanup, or VM decommission.\n"""\nimport json\nimport os\nimport pathlib\nimport re\nimport stat\nimport subprocess\nimport sys\nimport time\n\nSOURCE=pathlib.Path(\'/run/astra-synthetic-bundle\')\nBASE=pathlib.Path(\'/run/astra-synthetic-work\')\nCG=pathlib.Path(\'/sys/fs/cgroup\')\nREQUIRED={\'cpu\',\'memory\',\'pids\'}\nSCOPE=re.compile(r\'astra-synthetic-ci-[0-9a-f]{32}\\.scope\\Z\')\nENV={\'PATH\':\'/usr/bin:/bin\',\'LANG\':\'C\',\'LC_ALL\':\'C\',\'SYSTEMD_PAGER\':\'cat\'}\n\n\ndef show(unit,prop):\n    return subprocess.check_output([\'/usr/bin/systemctl\',\'show\',unit,\'--property=\'+prop,\'--value\'],\n                                   text=True,timeout=5,env=ENV).strip()\n\ndef _read(path):return path.read_text().strip()\ndef _write(path,value):path.write_text(value)\n\ndef check_owner(path,mode,uid=0):\n    st=path.lstat()\n    if not stat.S_ISDIR(st.st_mode) or st.st_uid!=uid or stat.S_IMODE(st.st_mode)!=mode:\n        raise ValueError(\'directory\')\n\ndef _inside(unit):\n    if os.geteuid()!=0 or SCOPE.fullmatch(unit) is None:raise ValueError(\'identity\')\n    check_owner(SOURCE,0o700)\n    if show(unit,\'Delegate\')!=\'yes\':raise ValueError(\'delegation\')\n    control=show(unit,\'ControlGroup\')\n    members=[x[3:] for x in _read(pathlib.Path(\'/proc/self/cgroup\')).splitlines() if x.startswith(\'0::/\')]\n    if members!=[control] or control!=\'/system.slice/\'+unit:raise ValueError(\'membership\')\n    scope=CG/control.lstrip(\'/\')\n    if set(_read(scope/\'cgroup.procs\').split())!={str(os.getpid())}:raise ValueError(\'scope\')\n    if not REQUIRED.issubset(_read(scope/\'cgroup.controllers\').split()):raise ValueError(\'controllers\')\n    manager=scope/\'astra-manager\';work=scope/\'astra-work\'\n    manager.mkdir(mode=0o700);_write(manager/\'cgroup.procs\',str(os.getpid()))\n    if _read(scope/\'cgroup.procs\'):raise ValueError(\'scope process\')\n    _write(scope/\'cgroup.subtree_control\',\'+cpu +memory +pids\')\n    if not REQUIRED.issubset(_read(scope/\'cgroup.subtree_control\').split()):raise ValueError(\'scope controller\')\n    work.mkdir(mode=0o700)\n    if not REQUIRED.issubset(_read(work/\'cgroup.controllers\').split()) or _read(work/\'cgroup.procs\'):raise ValueError(\'work\')\n    _write(work/\'cgroup.subtree_control\',\'+cpu +memory +pids\')\n    if not REQUIRED.issubset(_read(work/\'cgroup.subtree_control\').split()):raise ValueError(\'work controller\')\n    BASE.mkdir(mode=0o700);check_owner(BASE,0o700)\n    (BASE/\'packages\').mkdir(mode=0o700);(BASE/\'root\').mkdir(mode=0o700)\n    fds=[]\n    try:\n        flags=os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC\n        paths=(SOURCE,SOURCE/\'docs/ubuntu-runtime-evidence-20261119\',BASE/\'packages\',BASE/\'root\',CG,work)\n        fds=[os.open(p,flags) for p in paths]\n        # -I ignores cwd/PYTHONPATH; use a verified root-owned absolute bundle.\n        sys.path.insert(0,str(SOURCE))\n        from devtools import synthetic_no_engine_entry as entry\n        result=entry._Entry(*fds[:4],str(BASE/\'root\'),*fds[4:])._run_once()\n        # Known categorical subset only, no manager diagnostics or raw paths.\n        print(json.dumps(result,sort_keys=True,separators=(\',\',\':\')),flush=True)\n        return 0 if (result[\'fetch\']==\'fixed_17_downloads_rehashed\' and\n                     result[\'control\']==\'blocked_entry_record_and_exit_sampled\' and\n                     result[\'staging\']==\'kill_returned_empty_removed_sampled\' and\n                     result[\'service_watchdog\']==\'kill_returned_empty_sampled\' and\n                     result[\'engine_launch_authorized\'] is False and result[\'production_approved\'] is False) else 1\n    finally:\n        for fd in fds:\n            try:os.close(fd)\n            except OSError:pass\n        # Whole private work parent, not the manager-owned service slice.\n        # Best-effort no-name cleanup applies only inside exclusively owned scope.\n        try:\n            _write(work/\'cgroup.kill\',\'1\');until=time.monotonic()+5\n            while \'populated 1\' in _read(work/\'cgroup.events\') and time.monotonic()<until:time.sleep(.05)\n            if \'populated 1\' in _read(work/\'cgroup.events\'):raise ValueError(\'populated\')\n            for child in work.iterdir():\n                if child.is_dir():child.rmdir()\n            work.rmdir();print(\'delegated_work_cleanup=empty_removed_sampled\',flush=True)\n        except BaseException:\n            print(\'delegated_work_cleanup=uncertain\',flush=True)\n            raise ValueError(\'delegated cleanup uncertain\') from None\n        # Do not delete staged tree even on success: service cleanup unverified.\n\n\ndef main():\n    if len(sys.argv)!=2:raise ValueError(\'arguments\')\n    return _inside(sys.argv[1])\nif __name__==\'__main__\':\n    try:raise SystemExit(main())\n    except Exception:\n        print(\'synthetic_ci=unknown\',flush=True);raise SystemExit(1)\n'
+          if hashlib.sha256(raw).hexdigest()!='6c0e5c00e66d503e5e339baa55ae1f406cbb48a3896e603b52c227a3ecfddef7':raise ValueError('wrapper digest')
+          fd=os.open('/run/astra-synthetic-bundle/ci-wrapper.py',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o400)
+          try:
+           os.fchmod(fd,0o400);view=memoryview(raw)
+           while view:
+            n=os.write(fd,view)
+            if n<=0:raise ValueError('wrapper write')
+            view=view[n:]
+           os.fsync(fd)
+          finally:os.close(fd)
+          ASTRA_PRIVILEGED_SETUP
+          id=$(cat /proc/sys/kernel/random/uuid | tr -d '-')
+          [[ "$id" =~ ^[0-9a-f]{32}$ ]]
+          unit="astra-synthetic-ci-${id}.scope"
+          set +e
+          timeout --signal=TERM --kill-after=5s 280s sudo -n systemd-run --quiet --scope --unit="$unit" -p Delegate=yes /usr/bin/python3 -I /run/astra-synthetic-bundle/ci-wrapper.py "$unit"
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ];then echo 'synthetic_step=control_sampled_cleanup_not_fully_verified';else echo 'synthetic_step=unknown';fi
+          exit "$status"
