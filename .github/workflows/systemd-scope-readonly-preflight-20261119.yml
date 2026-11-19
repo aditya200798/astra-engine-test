@@ -1,0 +1,38 @@
+name: Systemd scope capability read-only preflight
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Read-only systemd and candidate parent observations
+        shell: bash
+        run: |
+          set -u
+          echo "READ_ONLY; no scope, child group, controller writes, or workloads"
+          echo "SYSTEMD_VERSION"
+          systemd-run --version | head -n 1 || true
+          echo "SYSTEMD_STATE"
+          timeout 5s systemctl is-system-running || true
+          echo "NONINTERACTIVE_SUDO"
+          if sudo -n true; then echo available; else echo unavailable; exit 0; fi
+          echo "CGROUP2_MOUNT"
+          findmnt -n -T /sys/fs/cgroup -o TARGET,FSTYPE,OPTIONS || true
+          echo "PROCESS_CGROUP"
+          cat /proc/self/cgroup
+          echo "SYSTEM_SLICE_PROPERTIES"
+          timeout 5s sudo -n systemctl show system.slice --property=Id,LoadState,ActiveState,ControlGroup,Delegate,CPUAccounting,MemoryAccounting,TasksAccounting || true
+          echo "ROOT_AND_SYSTEM_SLICE_CONTROLLER_STATE"
+          for path in /sys/fs/cgroup /sys/fs/cgroup/system.slice; do
+            echo "PATH=$path"
+            for file in cgroup.controllers cgroup.subtree_control cgroup.type cgroup.procs; do
+              if test -r "$path/$file"; then
+                if [ "$file" = cgroup.procs ]; then
+                  if [ -n "$(head -c 1 "$path/$file")" ]; then echo "$file=nonempty"; else echo "$file=empty"; fi
+                else printf "%s=" "$file"; cat "$path/$file"; fi
+              else echo "$file=missing_or_unreadable"; fi
+            done
+          done
+          echo "Observation only: availability does not establish delegation or permission to mutate."
