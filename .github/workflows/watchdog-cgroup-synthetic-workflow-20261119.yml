@@ -347,7 +347,9 @@ jobs:
                   if os.read(sys.stdin.fileno(), 1) != b'': raise RuntimeError('unexpected_outer_command')
                   return 1
               except Exception as e:
-                  print(json.dumps({'phase':'error','error':type(e).__name__+':'+str(e)[:100]}), flush=True)
+                  cause = e.__cause__
+                  print(json.dumps({'phase':'error','error':type(e).__name__+':'+str(e)[:100],
+                                    'cause': (type(cause).__name__+':'+str(cause)[:100]) if cause else None}), flush=True)
                   return 1
               finally:
                   if child is not None and child.poll() is None:
@@ -377,6 +379,10 @@ jobs:
                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                       env={'PATH':'/usr/bin:/bin','LANG':'C'}, close_fds=True, start_new_session=True)
                   group = json.loads(read_line(owner_p.stdout, 5))
+                  if group.get('phase') == 'error':
+                      result['owner_error'] = group.get('error')
+                      result['owner_cause'] = group.get('cause')
+                      raise RuntimeError('owner_setup_failed')
                   name = group.get('name')
                   if group.get('phase')!='group' or not isinstance(name,str) or len(name)!=43 or not name.startswith('astra-test-') or any(c not in '0123456789abcdef' for c in name[11:]):
                       raise RuntimeError('invalid_group_identity')
