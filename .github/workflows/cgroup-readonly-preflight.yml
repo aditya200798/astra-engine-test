@@ -1,0 +1,33 @@
+name: Read-only cgroup preflight
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Inspect cgroup v2 controller availability without writes
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo python3 - <<'PY'
+          import pathlib, json, os
+          membership = pathlib.Path('/proc/self/cgroup').read_text().splitlines()
+          item = next((x for x in membership if x.startswith('0::')), None)
+          if item is None:
+              print(json.dumps({'status':'cgroup_v2_not_found'})); raise SystemExit(0)
+          root = pathlib.Path('/sys/fs/cgroup')
+          path = item[3:]
+          parent = root / path.lstrip('/')
+          result = {'status':'observation_only','cgroup_v2':True}
+          for name in ('cgroup.controllers','cgroup.subtree_control','cgroup.type'):
+              try:
+                  result[name] = (parent/name).read_text().strip()
+              except OSError as exc:
+                  result[name] = 'unavailable:' + type(exc).__name__
+          for name in ('memory.max','pids.max','cpu.max'):
+              result[name+'_present'] = (parent/name).exists()
+          result['systemd_running'] = pathlib.Path('/run/systemd/system').is_dir()
+          print(json.dumps(result,sort_keys=True))
+          PY
