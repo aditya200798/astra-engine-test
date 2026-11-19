@@ -1,0 +1,863 @@
+name: Synthetic listener and controller lifecycle
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Fixed synthetic listener and controller
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/astra-listener-harness/devtools
+          cat > /tmp/astra-listener-harness/devtools/baseline_controller.py <<'FILE0'
+          """WIP developer-only lease/HTTP lifecycle for a *pre-contained* child.
+          
+          No executable launcher, filesystem isolation or cleanup supervisor is provided.
+          Only synthetic credentials/data in a fresh independently isolated runtime.
+          Not connected to production and not a security boundary. See README.
+          """
+          import asyncio
+          import base64
+          import json
+          import math
+          import re
+          
+          from .engine_controller import LeaseObservation
+          
+          MAX_HEADERS = 16384
+          MAX_BODY = 262144
+          MAX_STDERR = 65536
+          # This is intentionally public and synthetic, not a credential to protect.
+          SYNTHETIC_PASSWORD = 'astra-disposable-synthetic-only'
+          
+          
+          class BaselineError(RuntimeError):
+              pass
+          
+          
+          def _json(raw):
+              def pairs(items):
+                  result = {}
+                  for key, value in items:
+                      if key in result:
+                          raise ValueError('duplicate')
+                      result[key] = value
+                  return result
+          
+              def finite(value):
+                  number = float(value)
+                  if not math.isfinite(number):
+                      raise ValueError('nonfinite')
+                  return number
+              try:
+                  return json.loads(raw.decode('utf-8'), object_pairs_hook=pairs,
+                                    parse_constant=lambda _: (_ for _ in ()).throw(ValueError()),
+                                    parse_float=finite)
+              except (ValueError, UnicodeError, RecursionError):
+                  raise BaselineError('invalid response JSON') from None
+          
+          
+          async def _line(reader, remaining):
+              try:
+                  line = await reader.readuntil(b'\r\n')
+              except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+                  raise BaselineError('invalid HTTP line') from None
+              if len(line) > remaining or b'\0' in line:
+                  raise BaselineError('HTTP headers exceeded')
+              return line
+          
+          
+          async def _response(reader):
+              """Strict limited HTTP/1.x framing; no 1xx, trailers, compression or redirects."""
+              used = 0
+              status_line = await _line(reader, MAX_HEADERS)
+              used += len(status_line)
+              match = re.fullmatch(rb'HTTP/1\.[01] ([0-9]{3})(?: [\x20-\x7e]*)?\r\n', status_line)
+              if not match:
+                  raise BaselineError('invalid HTTP status')
+              status = int(match[1])
+              if status not in (200, 401):
+                  raise BaselineError('unexpected HTTP status')
+              headers = {}
+              while True:
+                  line = await _line(reader, MAX_HEADERS - used)
+                  used += len(line)
+                  if line == b'\r\n':
+                      break
+                  match = re.fullmatch(rb'([!#$%&\'*+.^_`|~0-9A-Za-z-]+):[ \t]*([^\r\n]*)\r\n', line)
+                  if not match or any(c < 32 and c != 9 or c == 127 for c in match[2]):
+                      raise BaselineError('invalid HTTP header')
+                  name = match[1].lower()
+                  if name in headers:
+                      raise BaselineError('duplicate HTTP header')
+                  headers[name] = match[2].strip().lower()
+              if b'content-encoding' in headers and headers[b'content-encoding'] != b'identity':
+                  raise BaselineError('encoded body unsupported')
+              length, transfer = headers.get(b'content-length'), headers.get(b'transfer-encoding')
+              if length is not None and transfer is not None:
+                  raise BaselineError('ambiguous framing')
+              if length is not None:
+                  if not re.fullmatch(rb'[0-9]{1,9}', length) or int(length) > MAX_BODY:
+                      raise BaselineError('invalid body length')
+                  try:
+                      body = await reader.readexactly(int(length))
+                  except asyncio.IncompleteReadError:
+                      raise BaselineError('truncated HTTP body') from None
+              elif transfer == b'chunked':
+                  body = bytearray()
+                  for _ in range(4096):
+                      line = await _line(reader, 128)
+                      value = line[:-2]
+                      if not re.fullmatch(rb'[0-9A-Fa-f]{1,8}', value):
+                          raise BaselineError('invalid chunk')
+                      size = int(value, 16)
+                      if size > MAX_BODY - len(body):
+                          raise BaselineError('body exceeded')
+                      if not size:
+                          if await _line(reader, 2) != b'\r\n':
+                              raise BaselineError('trailers unsupported')
+                          return status, bytes(body)
+                      try:
+                          chunk = await reader.readexactly(size + 2)
+                      except asyncio.IncompleteReadError:
+                          raise BaselineError('truncated chunk') from None
+                      if chunk[-2:] != b'\r\n':
+                          raise BaselineError('invalid chunk delimiter')
+                      body.extend(chunk[:-2])
+                  raise BaselineError('chunk count exceeded')
+              else:
+                  # HTTP/1.0 close-delimited responses are intentionally unsupported.
+                  raise BaselineError('unsupported HTTP framing')
+              return status, bytes(body)
+          
+          
+          async def _request(port, path, *, authenticated):
+              if (type(port) is not int or not 1 <= port <= 65535 or
+                      path not in ('/api/info', '/api/config') or
+                      authenticated not in (True, False, 'wrong') or
+                      type(authenticated) not in (bool, str)):
+                  raise BaselineError('invalid request')
+              reader, writer = await asyncio.open_connection('127.0.0.1', port, limit=MAX_HEADERS)
+              try:
+                  auth = b''
+                  if authenticated:
+                      password = 'intentionally-wrong-synthetic-password' if authenticated == 'wrong' else SYNTHETIC_PASSWORD
+                      token = base64.b64encode(('opencode:' + password).encode('ascii'))
+                      auth = b'Authorization: Basic ' + token + b'\r\n'
+                  writer.write(b'GET ' + path.encode('ascii') + b' HTTP/1.1\r\nHost: 127.0.0.1:' +
+                               str(port).encode('ascii') + b'\r\nAccept: application/json\r\n' + auth +
+                               b'Connection: close\r\n\r\n')
+                  await writer.drain()
+                  return await _response(reader)
+              finally:
+                  writer.close()
+                  # No wait_closed: peer may not cooperate. Overall outer watchdog still required.
+          
+          
+          async def observe_baseline(process, *, timeout=15.0, verify_listener=None):
+              """Drive one fixed synthetic-auth baseline against an already-launched child.
+          
+              process must be an asyncio subprocess with stdin/stdout/stderr pipes. This
+              function is unsafe to use without an independently isolated disposable
+              runtime and a supervisor that kills/reaps *all* descendants on every exit.
+              timeout is not an OS watchdog. Never replay ambiguous operations. Config
+              and info are returned only for the synthetic test, not authenticated facts.
+              Optional synchronous verify_listener(port) snapshots before and after each
+              request may block the event loop and do not authenticate the HTTP peer; the
+              caller is responsible for their validity. No callback means no observation.
+              """
+              try:
+                  valid_timeout = type(timeout) in (int, float) and math.isfinite(timeout) and 0 < timeout <= 60
+              except OverflowError:
+                  valid_timeout = False
+              if not valid_timeout:
+                  raise ValueError('invalid timeout')
+              if not all(getattr(process, attr, None) is not None for attr in ('stdin', 'stdout', 'stderr')):
+                  raise ValueError('process pipes required')
+              lease = LeaseObservation()
+              loop = asyncio.get_running_loop()
+              port_future = loop.create_future()
+              failure = loop.create_future()
+              stderr_count = 0
+          
+              async def stdout_drain():
+                  try:
+                      while True:
+                          data = await process.stdout.read(4096)
+                          if not data:
+                              result = lease.finish()
+                              if not port_future.done():
+                                  port_future.set_result(result['port'])
+                              return
+                          lease.feed(data)
+                          port = lease.port_if_complete()
+                          if port is not None and not port_future.done():
+                              port_future.set_result(port)
+                  except Exception:
+                      if not failure.done(): failure.set_result('stdout failure')
+          
+              async def stderr_drain():
+                  nonlocal stderr_count
+                  try:
+                      while True:
+                          data = await process.stderr.read(4096)
+                          if not data: return
+                          stderr_count += len(data)
+                          if stderr_count > MAX_STDERR:
+                              raise ValueError('limit')
+                  except Exception:
+                      if not failure.done(): failure.set_result('stderr failure')
+          
+              async def guarded(awaitable):
+                  task = asyncio.ensure_future(awaitable)
+                  try:
+                      done, _ = await asyncio.wait((task, failure), return_when=asyncio.FIRST_COMPLETED)
+                      if failure in done:
+                          raise BaselineError(failure.result())
+                      return task.result()
+                  finally:
+                      if not task.done():
+                          task.cancel()
+                          await asyncio.gather(task, return_exceptions=True)
+          
+              async def request_checked(port, path, authenticated):
+                  # Each snapshot is advisory, not an identity/security guarantee; races
+                  # can occur between the check and the HTTP connect/response.
+                  if verify_listener is not None:
+                      try:
+                          if verify_listener(port) is not True:
+                              raise ValueError('listener not observed')
+                      except Exception:
+                          raise BaselineError('listener observation failed') from None
+                  result = await _request(port, path, authenticated=authenticated)
+                  if verify_listener is not None:
+                      try:
+                          if verify_listener(port) is not True:
+                              raise ValueError('listener not observed')
+                      except Exception:
+                          raise BaselineError('listener observation failed') from None
+                  return result
+          
+              out_task = asyncio.create_task(stdout_drain())
+              err_task = asyncio.create_task(stderr_drain())
+              try:
+                  async with asyncio.timeout(timeout):
+                      port = await guarded(port_future)
+                      status, _ = await guarded(request_checked(port, '/api/info', authenticated=False))
+                      if status != 401: raise BaselineError('unauthenticated request not rejected')
+                      status, _ = await guarded(request_checked(port, '/api/info', authenticated='wrong'))
+                      if status != 401: raise BaselineError('wrong credential info not rejected')
+                      status, raw = await guarded(request_checked(port, '/api/info', authenticated=True))
+                      if status != 200: raise BaselineError('authenticated info not accepted')
+                      info = _json(raw)
+                      status, _ = await guarded(request_checked(port, '/api/config', authenticated=False))
+                      if status != 401: raise BaselineError('unauthenticated config not rejected')
+                      status, _ = await guarded(request_checked(port, '/api/config', authenticated='wrong'))
+                      if status != 401: raise BaselineError('wrong credential config not rejected')
+                      status, raw = await guarded(request_checked(port, '/api/config', authenticated=True))
+                      if status != 200: raise BaselineError('authenticated config not accepted')
+                      config = _json(raw)
+                      if not isinstance(info, dict) or not isinstance(config, list):
+                          raise BaselineError('unexpected response shape')
+                      process.stdin.close()
+                      await guarded(asyncio.gather(out_task, err_task))
+                      code = await guarded(process.wait())
+                      if code != 0: raise BaselineError('server exit failure')
+                      return {'unauth_info_status': 401, 'unauth_config_status': 401,
+                              'wrong_info_status': 401, 'wrong_config_status': 401, 'auth_info_status': 200,
+                              'auth_config_status': 200, 'info': info, 'config': config,
+                              'stderr_bytes': stderr_count, 'streams_complete': True,
+                              'direct_exit_code': code, 'descendant_cleanup': 'not_verified',
+                              'isolation': 'not_verified', 'provenance': 'not_verified',
+                              'listener_observation': ('callback_returned_true_before_and_after_each_request' if verify_listener is not None
+                                                       else 'not_performed')}
+              except (TimeoutError, ConnectionError, OSError, asyncio.IncompleteReadError):
+                  raise BaselineError('baseline timed out or I/O failed') from None
+              finally:
+                  try:
+                      process.stdin.close()
+                  except Exception:
+                      pass  # cleanup supervisor must treat incomplete cleanup as uncertain
+                  for task in (out_task, err_task):
+                      if not task.done(): task.cancel()
+                  await asyncio.gather(out_task, err_task, return_exceptions=True)
+          FILE0
+          cat > /tmp/astra-listener-harness/devtools/engine_controller.py <<'FILE1'
+          """Disabled genuine-engine controller design: strict lease-output parsing only.
+          
+          No process, filesystem, network or provider access. A successful parse is not
+          readiness or isolation. Actual server startup remains intentionally unavailable.
+          """
+          import json
+          import re
+          from urllib.parse import urlsplit
+          
+          MAX_LINE = 8192
+          MAX_LINES = 64
+          MAX_TOTAL = 65536
+          
+          
+          class ObservationError(ValueError):
+              pass
+          
+          
+          def _object_pairs(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError('duplicate object member')
+                  result[key] = value
+              return result
+          
+          
+          def _invalid_constant(_):
+              raise ValueError('invalid JSON constant')
+          
+          
+          def published_port(line):
+              """Parse a single newline-free upstream lease record, returning literal IPv4 port.
+          
+              Line must be raw bytes to prevent ambiguous decoding; only the exact record
+              shape and literal localhost URL are accepted. This does not contact a server.
+              """
+              if not isinstance(line, bytes) or not line or len(line) > MAX_LINE:
+                  raise ObservationError('invalid record length or type')
+              if b'\n' in line or b'\r' in line or b'\0' in line:
+                  raise ObservationError('invalid record controls')
+              try:
+                  obj = json.loads(line.decode('utf-8', errors='strict'), object_pairs_hook=_object_pairs,
+                                   parse_constant=_invalid_constant)
+                  if not isinstance(obj, dict) or set(obj) != {'url'} or not isinstance(obj['url'], str):
+                      raise ValueError('not a lease record')
+                  url = obj['url']
+                  if re.fullmatch(r'http://127\.0\.0\.1:[0-9]{1,5}/?', url) is None:
+                      raise ValueError('unexpected URL')
+                  parsed = urlsplit(url)
+                  if not (parsed.scheme == 'http' and parsed.hostname == '127.0.0.1'
+                          and parsed.username is None and parsed.password is None
+                          and parsed.path in ('', '/') and not parsed.query and not parsed.fragment
+                          and parsed.port is not None and 1 <= parsed.port <= 65535):
+                      raise ValueError('unexpected URL')
+                  return parsed.port
+              except (ValueError, UnicodeError, RecursionError, TypeError):
+                  raise ObservationError('invalid lease record') from None
+          
+          
+          class LeaseObservation:
+              """Bounded incremental parser for synthetic stdout; second lease is an error.
+          
+              Assumes caller supplies stdout only, not stderr. Each nonempty line must be a
+              lease record: unexpected logs fail closed rather than guessing. finish() is
+              required to notice an unterminated trailing line. EOF does not prove child or
+              descendants exited. Buffer limits do not impose an elapsed-time deadline.
+              """
+              def __init__(self):
+                  self._partial = bytearray()
+                  self._total = 0
+                  self._lines = 0
+                  self._port = None
+                  self._failed = False
+                  self._finished = False
+          
+              def feed(self, data):
+                  if self._failed or self._finished:
+                      raise ObservationError('observation already closed')
+                  if not isinstance(data, bytes):
+                      self._failed = True
+                      raise ObservationError('expected bytes')
+                  self._total += len(data)
+                  if self._total > MAX_TOTAL:
+                      self._failed = True
+                      raise ObservationError('total output exceeded')
+                  self._partial.extend(data)
+                  try:
+                      while b'\n' in self._partial:
+                          line, _, rest = self._partial.partition(b'\n')
+                          self._partial = bytearray(rest)
+                          self._lines += 1
+                          if self._lines > MAX_LINES:
+                              raise ObservationError('line count exceeded')
+                          if self._port is not None:
+                              raise ObservationError('unexpected extra output')
+                          self._port = published_port(bytes(line))
+                      if self._port is not None and self._partial:
+                          raise ObservationError('unexpected extra output')
+                      if len(self._partial) > MAX_LINE:
+                          raise ObservationError('line length exceeded')
+                  except ObservationError:
+                      self._failed = True
+                      raise
+          
+              def port_if_complete(self):
+                  """Return a published port without waiting for EOF, or None if incomplete.
+          
+                  This is only a provisional observation: the caller must continue draining
+                  and feeding output until EOF and fail on later output/errors. It proves
+                  neither server readiness nor authenticity and never launches anything.
+                  """
+                  if self._failed or self._finished:
+                      raise ObservationError('observation already closed')
+                  return self._port
+          
+              def finish(self):
+                  if self._failed or self._finished:
+                      raise ObservationError('observation already closed')
+                  self._finished = True
+                  if self._partial or self._port is None:
+                      raise ObservationError('incomplete lease record')
+                  return {'port': self._port, 'server_ready': 'not_verified',
+                          'auth': 'not_verified', 'cleanup': 'not_verified'}
+          
+          
+          def start(*args, **kwargs):
+              """Reserved: deliberately fail before inspecting arguments or doing any I/O."""
+              raise RuntimeError('genuine-engine controller disabled: isolation, provenance and startup unverified')
+          FILE1
+          cat > /tmp/astra-listener-harness/devtools/listener_observer.py <<'FILE2'
+          """Best-effort Linux direct-child listener observation, not endpoint authentication.
+          
+          Use only for synthetic-only disposable Linux tests, in the process's own network
+          namespace and with an independently enforced boundary/supervisor. A snapshot can
+          race socket transfer, process reuse or close/rebind. Never treat it as a security
+          boundary or permission to execute a binary. This module never launches processes.
+          """
+          import os
+          import re
+          
+          MAX_PROC_BYTES = 2 * 1024 * 1024
+          MAX_FDS = 4096
+          
+          
+          class ListenerObservationError(RuntimeError):
+              pass
+          
+          
+          def _read(path):
+              with open(path, 'rb') as f:
+                  data = f.read(MAX_PROC_BYTES + 1)
+              if len(data) > MAX_PROC_BYTES:
+                  raise ListenerObservationError('proc limit')
+              return data
+          
+          
+          def _start_time(pid):
+              # comm can contain spaces and right parentheses: the last ')' closes it.
+              data = _read('/proc/%d/stat' % pid)
+              close = data.rfind(b')')
+              if close < 0:
+                  raise ListenerObservationError('invalid stat')
+              fields = data[close + 1:].split()
+              if len(fields) < 20 or not fields[19].isdigit():
+                  raise ListenerObservationError('invalid stat')
+              return int(fields[19])  # field 22, fields starts at field 3
+          
+          
+          def _listeners(port):
+              hits = []
+              for family in ('tcp', 'tcp6'):
+                  lines = _read('/proc/net/' + family).splitlines()
+                  if not lines:
+                      raise ListenerObservationError('missing network table')
+                  for line in lines[1:]:
+                      columns = line.split()
+                      if len(columns) < 10:
+                          raise ListenerObservationError('invalid network table')
+                      local = columns[1].split(b':')
+                      if len(local) != 2 or not re.fullmatch(rb'[0-9A-Fa-f]{4}', local[1]):
+                          raise ListenerObservationError('invalid local endpoint')
+                      if int(local[1], 16) == port and columns[3] == b'0A':
+                          if not columns[9].isdigit():
+                              raise ListenerObservationError('invalid inode')
+                          hits.append((family, local[0].upper(), int(columns[9])))
+              return hits
+          
+          
+          class DirectListenerObserver:
+              """Snapshot Linux listener inode ownership by a direct PID, fail closed.
+          
+              The PID's start time and its network namespace are captured at creation and
+              rechecked for each observation. Caller must instantiate promptly after spawn
+              and keep the child unreaped. Does not eliminate PID/FD/network TOCTOU races.
+              """
+              def __init__(self, pid):
+                  if type(pid) is not int or pid <= 0:
+                      raise ListenerObservationError('invalid pid')
+                  self.pid = pid
+                  try:
+                      self.start_time = _start_time(pid)
+                      self.namespace = os.stat('/proc/%d/ns/net' % pid)
+                      own = os.stat('/proc/self/ns/net')
+                      if (self.namespace.st_dev, self.namespace.st_ino) != (own.st_dev, own.st_ino):
+                          raise ListenerObservationError('different network namespace')
+                  except (OSError, ValueError) as exc:
+                      raise ListenerObservationError('process observation unavailable') from exc
+          
+              def __call__(self, port):
+                  if type(port) is not int or not 1 <= port <= 65535:
+                      raise ListenerObservationError('invalid port')
+                  try:
+                      if _start_time(self.pid) != self.start_time:
+                          raise ListenerObservationError('process changed')
+                      current_ns = os.stat('/proc/%d/ns/net' % self.pid)
+                      own_ns = os.stat('/proc/self/ns/net')
+                      key = lambda st: (st.st_dev, st.st_ino)
+                      if key(current_ns) != key(self.namespace) or key(own_ns) != key(self.namespace):
+                          raise ListenerObservationError('network namespace changed')
+                      hits = _listeners(port)
+                      if len(hits) != 1 or hits[0][:2] != ('tcp', b'0100007F'):
+                          raise ListenerObservationError('not sole loopback listener')
+                      inode = hits[0][2]
+                      base = '/proc/%d/fd' % self.pid
+                      sockets = set()
+                      with os.scandir(base) as entries:
+                          for count, item in enumerate(entries, 1):
+                              if count > MAX_FDS:
+                                  raise ListenerObservationError('fd limit')
+                              if not item.name.isdigit():
+                                  raise ListenerObservationError('invalid fd')
+                              try:
+                                  target = os.readlink(base + '/' + item.name)
+                              except FileNotFoundError:
+                                  # A closed FD can hide the endpoint in a racing snapshot.
+                                  raise ListenerObservationError('fd changed') from None
+                              match = re.fullmatch(r'socket:\[([0-9]+)\]', target)
+                              if match:
+                                  sockets.add(int(match[1]))
+                      if inode not in sockets or _start_time(self.pid) != self.start_time:
+                          raise ListenerObservationError('listener owner not observed')
+                      if _listeners(port) != hits:
+                          raise ListenerObservationError('listener changed')
+                      return True
+                  except (OSError, ValueError) as exc:
+                      raise ListenerObservationError('listener observation unavailable') from exc
+          FILE2
+          cat > /tmp/astra-listener-harness/devtools/ci_boundary_controller_probe.py <<'FILE3'
+          #!/usr/bin/python3
+          """Fixed disposable CI probe, synthetic only. Never starts an engine."""
+          import errno, json, os, selectors, socket, subprocess, sys, time
+          
+          ENV = {'PATH': '/usr/bin:/bin', 'HOME': '/work/home', 'TMPDIR': '/work/tmp', 'LANG': 'C', 'LC_ALL': 'C'}
+          
+          
+          def env_diagnostic(environ):
+              # Never log unknown names or any values. Locale coercion is a known hypothesis.
+              return {'exact': dict(environ) == ENV,
+                      'expected_match': {key: environ.get(key) == value for key, value in ENV.items()},
+                      'unexpected_count': len(set(environ) - set(ENV)),
+                      'lc_ctype_present': 'LC_CTYPE' in environ}
+          
+          
+          def env_gate(environ):
+              diagnostic = env_diagnostic(environ)
+              return diagnostic['exact'], diagnostic
+          
+          def server():
+              s = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen(1); s.settimeout(3)
+              pid = os.fork()
+              if pid == 0:
+                  os.setsid()
+                  f = os.open('/dev/null', os.O_RDWR)
+                  for n in (0, 1, 2): os.dup2(f, n)
+                  while True: time.sleep(1)
+              print(json.dumps({'url':'http://127.0.0.1:%d' % s.getsockname()[1], 'descendant':pid}), flush=True)
+              conn, _ = s.accept()
+              with conn:
+                  conn.settimeout(2)
+                  assert conn.recv(1) == b'A'
+                  conn.sendall(b'B')
+              assert sys.stdin.buffer.read(1) == b''
+              s.close()
+          
+          
+          def route(family, kind, addr):
+              try:
+                  with socket.socket(family, kind) as s:
+                      s.settimeout(.5); s.connect(addr)
+                  return 'connected'
+              except OSError as e:
+                  return 'errno:%s' % e.errno
+          
+          
+          def driver():
+              checks = {}
+              status = {}
+              for line in open('/proc/self/status'):
+                  if ':' in line:
+                      k, v = line.split(':', 1); status[k] = v.strip()
+              checks['env_exact'], env_report = env_gate(os.environ)
+              checks['uid_nonroot'] = os.getuid() == 65534 and os.getgid() == 65534
+              checks['no_caps_nnp'] = all(int(status.get(x, '1'), 16) == 0 for x in ('CapEff', 'CapPrm', 'CapInh', 'CapAmb')) and status.get('NoNewPrivs') == '1'
+              checks['host_paths_hidden'] = not os.path.exists('/tmp/astra-boundary-host-sentinel') and not os.path.exists('/root') and not os.path.exists('/run') and not os.path.exists('/home/runner')
+              checks['home_clean'] = os.listdir('/work/home') == [] and os.listdir('/work/tmp') == []
+              checks['host_etc_hidden'] = not os.path.exists('/etc/passwd')
+              checks['network'] = {str(x) for _, x in socket.if_nameindex()} == {'lo'}
+              checks['routes'] = all(route(*args) == 'errno:%s' % errno.ENETUNREACH for args in [
+                  (socket.AF_INET, socket.SOCK_DGRAM, ('192.0.2.53',53)),
+                  (socket.AF_INET6, socket.SOCK_DGRAM, ('2001:db8::53',53)),
+                  (socket.AF_INET, socket.SOCK_STREAM, ('192.0.2.1',9)),
+                  (socket.AF_INET6, socket.SOCK_STREAM, ('2001:db8::1',9))])
+              fds = []
+              for n in os.listdir('/proc/self/fd'):
+                  try: os.readlink('/proc/self/fd/' + n); fds.append(int(n))
+                  except FileNotFoundError: pass
+              checks['fds_only_stdio'] = sorted(fds) == [0,1,2]
+              p = subprocess.Popen([sys.executable, '-I', '/probe.py', '--server'], env=ENV,
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True)
+              try:
+                  sel = selectors.DefaultSelector()
+                  sel.register(p.stdout, selectors.EVENT_READ); sel.register(p.stderr, selectors.EVENT_READ)
+                  deadline = time.monotonic() + 4; buf = bytearray(); err = bytearray()
+                  while b'\n' not in buf and time.monotonic() < deadline:
+                      for key, _ in sel.select(max(0, deadline-time.monotonic())):
+                          chunk = os.read(key.fd, 4096)
+                          if not chunk: raise RuntimeError('premature_eof')
+                          target = buf if key.fileobj is p.stdout else err
+                          target.extend(chunk)
+                          if len(buf) + len(err) > 8192: raise RuntimeError('output_limit')
+                  sel.close()
+                  if not buf.endswith(b'\n') or buf.count(b'\n') != 1: raise RuntimeError('lease_format')
+                  record = json.loads(buf); url = record['url']; prefix = 'http://127.0.0.1:'
+                  if not url.startswith(prefix) or not url[len(prefix):].isdigit(): raise RuntimeError('lease_url')
+                  port = int(url[len(prefix):]); assert 1 <= port <= 65535
+                  with socket.create_connection(('127.0.0.1', port), timeout=2) as c:
+                      c.sendall(b'A'); checks['loopback_exchange'] = c.recv(1) == b'B'
+                  p.stdin.close(); p.wait(timeout=3)
+                  checks['lease_close_exits_server'] = p.returncode == 0
+                  checks['descendant_setsess'] = os.getsid(record['descendant']) == record['descendant']
+              finally:
+                  if p.poll() is None: p.kill(); p.wait(timeout=2)
+                  for f in (p.stdin, p.stdout, p.stderr):
+                      if f and not f.closed: f.close()
+              result = {'synthetic_only': True, 'engine_launch_authorized': False, 'checks':checks, 'environment_diagnostic':env_report, 'pass': all(checks.values())}
+              print(json.dumps(result, sort_keys=True), flush=True)
+              if not result['pass']: return 1
+              # Stay alive with the setsid descendant until the host kills the cgroup.
+              while True: time.sleep(1)
+          
+          if __name__ == '__main__':
+              if sys.argv[1:] == ['--server']: server()
+              elif sys.argv[1:] == []: sys.exit(driver())
+              else: sys.exit(2)
+          FILE3
+          cat > /tmp/astra-listener-harness/devtools/ci_listener_fixture.py <<'FILE4'
+          #!/usr/bin/python3
+          """Fixed synthetic child for listener+baseline CI; no engine or provider."""
+          import asyncio
+          import base64
+          import json
+          import os
+          import sys
+          
+          PASSWORD = 'astra-disposable-synthetic-only'
+          
+          async def serve(mode):
+              async def request(reader, writer):
+                  try:
+                      raw = await reader.readuntil(b'\r\n\r\n')
+                      token = base64.b64encode(('opencode:' + PASSWORD).encode())
+                      auth = b'Authorization: Basic ' + token + b'\r\n' in raw
+                      wrong = base64.b64encode(b'opencode:intentionally-wrong-synthetic-password')
+                      wrong_auth = b'Authorization: Basic ' + wrong + b'\r\n' in raw
+                      wrong_accepted = wrong_auth and ((mode == 'wronginfo' and raw.startswith(b'GET /api/info ')) or (mode == 'wrongconfig' and raw.startswith(b'GET /api/config ')))
+                      if mode == 'hang':
+                          await asyncio.sleep(10)
+                          return
+                      if mode == 'extra':
+                          print('unexpected', flush=True)
+                      if mode == 'flood':
+                          sys.stderr.buffer.write(b'x' * 70000)
+                          sys.stderr.flush()
+                      if not auth and mode != 'noauth' and not wrong_accepted:
+                          status, body = b'401 Unauthorized', b'{}'
+                      else:
+                          status = b'200 OK'
+                          body = b'[]' if raw.startswith(b'GET /api/config ') else b'{"status":"synthetic"}'
+                      writer.write(b'HTTP/1.1 ' + status + b'\r\nContent-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body)
+                      await writer.drain()
+                  finally:
+                      writer.close()
+              server = await asyncio.start_server(request, '127.0.0.1', 0)
+              port = server.sockets[0].getsockname()[1]
+              # A descendant with its own session and closed streams remains for cgroup cleanup.
+              pid = os.fork()
+              if pid == 0:
+                  os.setsid()
+                  fd = os.open('/dev/null', os.O_RDWR)
+                  for n in (0, 1, 2): os.dup2(fd, n)
+                  while True: __import__('time').sleep(1)
+              print(json.dumps({'url': 'http://127.0.0.1:%d' % port}), flush=True)
+              await asyncio.to_thread(sys.stdin.buffer.read)
+              server.close()
+              await server.wait_closed()
+          
+          if __name__ == '__main__':
+              if sys.argv[1:] not in ([x] for x in ('ok', 'noauth', 'wronginfo', 'wrongconfig', 'extra', 'flood', 'hang')):
+                  raise SystemExit(2)
+              asyncio.run(serve(sys.argv[1]))
+          FILE4
+          cat > /tmp/astra-listener-harness/devtools/ci_listener_driver.py <<'FILE5'
+          #!/usr/bin/python3
+          """Synthetic listener+controller loopback test in a fresh private CI namespace only."""
+          import asyncio
+          import errno
+          import json
+          import os
+          import socket
+          import sys
+          import time
+          
+          # Check the inherited descriptors before creating the event loop.
+          INHERITED_FDS = []
+          for name in os.listdir('/proc/self/fd'):
+              try:
+                  os.readlink('/proc/self/fd/'+name)
+                  INHERITED_FDS.append(int(name))
+              except FileNotFoundError:
+                  pass
+          
+          sys.path.insert(0, '/harness')
+          from devtools.baseline_controller import BaselineError, observe_baseline
+          from devtools.listener_observer import DirectListenerObserver
+          from devtools.ci_boundary_controller_probe import ENV, env_diagnostic, route
+          
+          async def case(mode):
+              fixture_mode = 'ok' if mode == 'owner_rejected' else mode
+              proc = await asyncio.create_subprocess_exec(
+                  '/usr/bin/python3', '-I', '/harness/devtools/ci_listener_fixture.py', fixture_mode,
+                  stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                  stderr=asyncio.subprocess.PIPE, env=ENV, close_fds=True)
+              result = None
+              try:
+                  owner = DirectListenerObserver(proc.pid)
+                  observed = 0
+                  def verify(port):
+                      nonlocal observed
+                      if owner(port) is not True:
+                          return False
+                      observed += 1
+                      return mode != 'owner_rejected'
+                  try:
+                      result = await observe_baseline(proc, timeout=1.5 if mode == 'hang' else 5,
+                                                      verify_listener=verify)
+                      outcome = 'success'
+                  except BaselineError as exc:
+                      outcome = str(exc)
+                  try:
+                      await asyncio.wait_for(proc.wait(), 2)
+                  except TimeoutError:
+                      proc.kill()
+                      await asyncio.wait_for(proc.wait(), 2)
+                  if mode == 'ok':
+                      return bool(outcome == 'success' and result['streams_complete'] and
+                                  result['direct_exit_code'] == 0 and result['info'] == {'status':'synthetic'} and
+                                  result['config'] == [] and result['descendant_cleanup'] == 'not_verified' and
+                                  result['listener_observation'] == 'callback_returned_true_before_and_after_each_request' and observed == 12)
+                  expected = {'noauth':'unauthenticated request not rejected',
+                              'wronginfo':'wrong credential info not rejected',
+                              'wrongconfig':'wrong credential config not rejected',
+                              'extra':'stdout failure', 'flood':'stderr failure',
+                              'hang':'baseline timed out or I/O failed',
+                              'owner_rejected':'listener observation failed'}
+                  return outcome == expected[mode] and observed > 0
+              finally:
+                  if proc.returncode is None:
+                      proc.kill()
+                      await proc.wait()
+          
+          async def driver():
+              status = {}
+              with open('/proc/self/status') as stream:
+                  for line in stream:
+                      if ':' in line:
+                          k,v=line.split(':',1); status[k]=v.strip()
+              diag=env_diagnostic(os.environ)
+              checks={'env_exact':diag['exact'], 'uid_nonroot':os.getuid()==65534 and os.getgid()==65534,
+                      'no_caps_nnp':all(int(status.get(x,'1'),16)==0 for x in ('CapEff','CapPrm','CapInh','CapAmb')) and status.get('NoNewPrivs')=='1',
+                      'inherited_fds_only_stdio': sorted(INHERITED_FDS) == [0,1,2],
+                      'host_paths_hidden': not any(os.path.exists(p) for p in ('/tmp/astra-boundary-host-sentinel','/root','/run','/home/runner','/etc/passwd')),
+                      'home_tmp_empty': not os.listdir('/work/home') and not os.listdir('/work/tmp'),
+                      'network_loopback_only': {name for _,name in socket.if_nameindex()} == {'lo'},
+                      'routes_unreachable': all(route(*v) == 'errno:%d' % errno.ENETUNREACH for v in [
+                          (socket.AF_INET,socket.SOCK_DGRAM,('192.0.2.53',53)),
+                          (socket.AF_INET6,socket.SOCK_DGRAM,('2001:db8::53',53)),
+                          (socket.AF_INET,socket.SOCK_STREAM,('192.0.2.1',9)),
+                          (socket.AF_INET6,socket.SOCK_STREAM,('2001:db8::1',9))])}
+              if not all(checks.values()):
+                  return {'synthetic_only':True, 'engine_launch_authorized':False,'checks':checks, 'pass':False}
+              for mode in ('ok', 'noauth', 'wronginfo', 'wrongconfig', 'extra', 'flood', 'hang', 'owner_rejected'):
+                  checks['case_'+mode] = await case(mode)
+              return {'synthetic_only':True, 'engine_launch_authorized':False,'checks':checks, 'pass':all(checks.values())}
+          
+          if __name__ == '__main__':
+              result = asyncio.run(driver())
+              print(json.dumps(result,sort_keys=True), flush=True)
+              if not result['pass']: raise SystemExit(1)
+              # Keep namespace and detached fixture descendants alive for external cgroup kill.
+              while True: time.sleep(1)
+          FILE5
+          cat > /tmp/astra-listener-host.py <<'HOST'
+          #!/usr/bin/python3
+          """Fixed synthetic listener/baseline host supervisor: isolated disposable CI VM only."""
+          import json, os, selectors, subprocess, sys, tempfile, time
+          from pathlib import Path
+          
+          def main():
+              parent = '/sys/fs/cgroup' + next(x[3:] for x in Path('/proc/self/cgroup').read_text().splitlines() if x.startswith('0::/'))
+              group = tempfile.mkdtemp(prefix='astra-boundary-', dir=parent)
+              p = None; result = {'synthetic_only':True, 'engine_launch_authorized':False, 'pass':False}; errors=[]
+              try:
+                  # Shell blocks until membership is confirmed; no fork before enrollment.
+                  command = ['/bin/sh', '-c', 'IFS= read -r go; [ "$go" = GO ] || exit 9; exec /usr/bin/unshare -n /bin/sh -c "ip link set lo up && exec bwrap --unshare-pid --unshare-ipc --unshare-uts --die-with-parent --chmod 0755 / --dir /usr --chmod 0755 /usr --ro-bind /usr/bin /usr/bin --ro-bind /usr/lib /usr/lib --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --ro-bind /usr/lib64 /usr/lib64 --dir /etc --ro-bind /etc/ld.so.cache /etc/ld.so.cache --tmpfs /work --dir /work/home --dir /work/tmp --chmod 0777 /work/home --chmod 0777 /work/tmp --dev /dev --proc /proc --ro-bind /tmp/astra-listener-harness /harness --chdir /work --clearenv --setenv PATH /usr/bin:/bin --setenv HOME /work/home --setenv TMPDIR /work/tmp --setenv LANG C --setenv LC_ALL C -- /usr/bin/setpriv --reuid 65534 --regid 65534 --clear-groups --no-new-privs /usr/bin/env -i PATH=/usr/bin:/bin HOME=/work/home TMPDIR=/work/tmp LANG=C LC_ALL=C /usr/bin/python3 -I /harness/devtools/ci_listener_driver.py"']
+                  p = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       env={'PATH':'/usr/bin:/bin', 'SYNTHETIC_SECRET':'not-a-real-secret'}, close_fds=True, start_new_session=True)
+                  Path(group+'/cgroup.procs').write_text(str(p.pid))
+                  if str(p.pid) not in Path(group+'/cgroup.procs').read_text().split(): raise RuntimeError('enrollment_failed')
+                  p.stdin.write(b'GO\n'); p.stdin.flush(); p.stdin.close(); p.stdin=None
+                  sel = selectors.DefaultSelector(); out=bytearray(); err=bytearray()
+                  for f in (p.stdout, p.stderr):
+                      os.set_blocking(f.fileno(), False); sel.register(f, selectors.EVENT_READ)
+                  deadline = time.monotonic()+30
+                  while b'\n' not in out and time.monotonic()<deadline:
+                      events=sel.select(min(.1, max(0,deadline-time.monotonic())))
+                      for key, _ in events:
+                          chunk=os.read(key.fd, 4096)
+                          if not chunk: sel.unregister(key.fileobj); continue
+                          (out if key.fileobj is p.stdout else err).extend(chunk)
+                          if len(out)+len(err)>16384: raise RuntimeError('output_excess')
+                      if p.poll() is not None and b'\n' not in out: break
+                  sel.close()
+                  result['stderr_bytes'] = len(err)
+                  try: result['driver'] = json.loads(out)
+                  except ValueError: result['stdout_invalid'] = True
+                  if not result.get('driver'): raise RuntimeError('no_report')
+                  result['populated_before_cleanup'] = 'populated 1' in Path(group+'/cgroup.events').read_text()
+              except Exception as e: result['error'] = type(e).__name__+':'+str(e)[:200]
+              finally:
+                  try:
+                      Path(group+'/cgroup.kill').write_text('1')
+                      end=time.monotonic()+3
+                      while 'populated 1' in Path(group+'/cgroup.events').read_text() and time.monotonic()<end: time.sleep(.02)
+                      result['empty'] = 'populated 0' in Path(group+'/cgroup.events').read_text()
+                  except Exception as e: errors.append('kill:'+type(e).__name__)
+                  if p is not None:
+                      try:
+                          if p.poll() is None: p.kill()
+                          p.wait(timeout=2); result['reaped']=True
+                      except Exception as e: errors.append('reap:'+type(e).__name__)
+                  try: os.rmdir(group); result['removed']=True
+                  except OSError as e: errors.append('rmdir:'+str(e.errno))
+                  result['cleanup_errors']=errors
+              result['pass'] = bool(result.get('driver',{}).get('pass') and result.get('populated_before_cleanup') and result.get('empty') and result.get('reaped') and result.get('removed') and not errors)
+              print(json.dumps(result,sort_keys=True), flush=True)
+              return 0 if result['pass'] else 1
+          if __name__ == '__main__': sys.exit(main())
+          HOST
+          chmod -R a+rX /tmp/astra-listener-harness
+          printf 'synthetic-only' > /tmp/astra-boundary-host-sentinel
+          sha256sum /tmp/astra-listener-harness/devtools/*.py /tmp/astra-listener-host.py
+          if ! command -v bwrap >/dev/null; then sudo -n apt-get update -qq && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends bubblewrap; fi
+          sudo -n timeout --signal=TERM --kill-after=3s 45s env -i PATH=/usr/bin:/bin LANG=C /usr/bin/python3 -I /tmp/astra-listener-host.py
