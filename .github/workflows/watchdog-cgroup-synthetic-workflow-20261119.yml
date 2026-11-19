@@ -1,0 +1,477 @@
+name: Fixed synthetic watchdog cgroup lifecycle
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Disposable synthetic cgroup test
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/astra-watchdog-harness/devtools
+          cat > /tmp/astra-watchdog-harness/devtools/cgroup_watchdog.py <<'MODULE'
+          """WIP developer-only cgroup-v2 guard for an expendable Linux CI VM.
+          
+          No command launcher, engine authorization or integration with production.
+          Creates only a random child cgroup. Use from a SINGLE-THREADED, credential-free
+          supervisor on a disposable VM, never an Android device or valuable workload.
+          A watchdog fork outside that child kills the group on owner-pipe EOF, unexpected
+          input or deadline. This is defense-in-depth, not a guarantee against kernel hangs,
+          watchdog death, cgroup escapes, missing delegation, VM loss or host interference.
+          """
+          import ctypes
+          import errno
+          import os
+          import secrets
+          import select
+          import signal
+          import stat
+          import sys
+          import time
+          
+          CGROUP2_SUPER_MAGIC = 0x63677270
+          LIMITS = {'memory.max': '1073741824', 'pids.max': '64', 'cpu.max': '100000 100000'}
+          
+          
+          class GuardError(RuntimeError):
+              pass
+          
+          
+          def _is_cgroup2(fd):
+              if not sys.platform.startswith('linux'):
+                  return False
+              # Linux statfs fits in this aligned array; f_type is its first long.
+              buf = (ctypes.c_long * 64)()
+              libc = ctypes.CDLL(None, use_errno=True)
+              if libc.fstatfs(fd, ctypes.byref(buf)) != 0:
+                  return False
+              return buf[0] == CGROUP2_SUPER_MAGIC
+          
+          
+          def _read(fd, name, limit=4096):
+              f = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+              try:
+                  data = os.read(f, limit + 1)
+                  if len(data) > limit:
+                      raise GuardError('oversized cgroup response')
+                  return data.decode('ascii', errors='strict').strip()
+              finally:
+                  os.close(f)
+          
+          
+          def _write(fd, name, value):
+              f = os.open(name, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+              try:
+                  data = value.encode('ascii')
+                  if os.write(f, data) != len(data):
+                      raise GuardError('short cgroup write')
+              finally:
+                  os.close(f)
+          
+          
+          def _populated(text):
+              values = []
+              for line in text.splitlines():
+                  fields = line.split()
+                  if len(fields) == 2 and fields[0] == 'populated':
+                      values.append(fields[1])
+              if len(values) != 1 or values[0] not in ('0', '1'):
+                  raise GuardError('invalid cgroup.events')
+              return values[0] == '1'
+          
+          
+          def _wait_trigger(read_fd, deadline):
+              """EOF, any unexpected message, or timeout means terminate the group."""
+              while True:
+                  remaining = deadline - time.monotonic()
+                  if remaining <= 0:
+                      return 'deadline'
+                  try:
+                      readable, _, _ = select.select([read_fd], [], [], remaining)
+                      if readable:
+                          return 'pipe_closed' if os.read(read_fd, 1) == b'' else 'unexpected_input'
+                  except InterruptedError:
+                      continue
+          
+          
+          def _child_watch(group_fd, read_fd, ready_fd, deadline):
+              # SIGTERM/SIGHUP must not casually disable the watchdog when the parent dies.
+              # SIGKILL, host failure, or a stuck syscall still defeat it.
+              signal.signal(signal.SIGHUP, signal.SIG_IGN)
+              signal.signal(signal.SIGTERM, signal.SIG_IGN)
+              os.write(ready_fd, b'R')
+              os.close(ready_fd)
+              _wait_trigger(read_fd, deadline)
+              _write(group_fd, 'cgroup.kill', '1')
+              until = time.monotonic() + 3
+              while _populated(_read(group_fd, 'cgroup.events')):
+                  if time.monotonic() >= until:
+                      return 2
+                  time.sleep(.02)
+              return 0
+          
+          
+          def create_guard(parent_fd, timeout=60):
+              """Create limited empty child and ready watchdog; does not launch a program.
+          
+              Caller supplies a delegated cgroup-v2 parent FD in a disposable CI VM with
+              memory, pids and cpu controllers available. Do not call in a threaded
+              process (Python fork safety). No external task may enter the group until the
+              watchdog readiness return. This function exposes the child FD for future
+              enrollment plumbing only; it does not verify a PID is blocked or prevent
+              external tampering. Never treat it as an engine readiness or sandbox gate.
+              """
+              if (type(parent_fd) is not int or parent_fd < 0 or type(timeout) not in (int, float)
+                      or not 5 <= timeout <= 120):
+                  raise GuardError('invalid arguments')
+              if not stat.S_ISDIR(os.fstat(parent_fd).st_mode) or not _is_cgroup2(parent_fd):
+                  raise GuardError('cgroup-v2 parent required')
+              name = 'astra-test-' + secrets.token_hex(16)
+              group_fd = None
+              pipe_r = pipe_w = ready_r = ready_w = None
+              child = None
+              made = False
+              try:
+                  os.mkdir(name, 0o700, dir_fd=parent_fd)
+                  made = True
+                  group_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+                  if not _is_cgroup2(group_fd) or _populated(_read(group_fd, 'cgroup.events')):
+                      raise GuardError('new group is not empty cgroup-v2')
+                  # Probe required controls and retain hard failure if unavailable.
+                  for key, value in LIMITS.items():
+                      _write(group_fd, key, value)
+                      if _read(group_fd, key) != value:
+                          raise GuardError('resource limit readback mismatch')
+                  # Opening without writing checks presence/access; no tasks exist yet.
+                  kfd = os.open('cgroup.kill', os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=group_fd)
+                  os.close(kfd)
+                  pipe_r, pipe_w = os.pipe2(os.O_CLOEXEC)
+                  ready_r, ready_w = os.pipe2(os.O_CLOEXEC)
+                  deadline = time.monotonic() + timeout
+                  child = os.fork()
+                  if child == 0:
+                      try:
+                          os.close(pipe_w); os.close(ready_r)
+                          # Close every inherited descriptor except these three. A strict
+                          # single-threaded caller avoids concurrent descriptor races.
+                          keep = {group_fd, pipe_r, ready_w}
+                          for entry in os.listdir('/proc/self/fd'):
+                              fd = int(entry)
+                              if fd not in keep:
+                                  try: os.close(fd)
+                                  except OSError as exc:
+                                      if exc.errno != errno.EBADF: raise
+                          code = _child_watch(group_fd, pipe_r, ready_w, deadline)
+                      except BaseException:
+                          code = 3
+                      os._exit(code)
+                  os.close(pipe_r); pipe_r = None
+                  os.close(ready_w); ready_w = None
+                  available, _, _ = select.select([ready_r], [], [], 2)
+                  if not available or os.read(ready_r, 1) != b'R':
+                      raise GuardError('watchdog readiness failed')
+                  os.close(ready_r); ready_r = None
+                  return Guard(parent_fd, name, group_fd, pipe_w, child)
+              except BaseException as exc:
+                  for fd in (pipe_r, pipe_w, ready_r, ready_w):
+                      if fd is not None:
+                          try: os.close(fd)
+                          except OSError: pass
+                  # Do not hang waiting on a broken child; stop and reap when possible.
+                  if child:
+                      try: os.kill(child, signal.SIGKILL)
+                      except ProcessLookupError: pass
+                      try: os.waitpid(child, 0)
+                      except ChildProcessError: pass
+                  if group_fd is not None:
+                      try: os.close(group_fd)
+                      except OSError: pass
+                  if made:
+                      try: os.rmdir(name, dir_fd=parent_fd)
+                      except OSError: raise GuardError('guard setup failed; cleanup uncertain') from None
+                  raise GuardError('guard setup failed') from exc
+          
+          
+          class Guard:
+              """Owner handle: close pipe triggers watchdog kill even on normal completion.
+          
+              Caller must retain parent_fd, never duplicate/inherit the owner write-end,
+              and never let workloads access cgroup control files. No __del__ promise.
+              finish is bounded by its own wait loop, but kernel syscalls can still hang.
+              """
+              def __init__(self, parent_fd, name, group_fd, pipe_w, child):
+                  self.parent_fd, self.name, self.group_fd = parent_fd, name, group_fd
+                  self.pipe_w, self.child = pipe_w, child
+                  self.finished = False
+          
+              def finish(self):
+                  if self.finished:
+                      raise GuardError('guard already finished')
+                  self.finished = True
+                  os.close(self.pipe_w)
+                  until = time.monotonic() + 5
+                  status = None
+                  while time.monotonic() < until:
+                      pid, value = os.waitpid(self.child, os.WNOHANG)
+                      if pid:
+                          status = value
+                          break
+                      time.sleep(.02)
+                  if status is None or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                      # Do not pretend a missing watchdog means the cgroup is empty.
+                      os.close(self.group_fd)
+                      raise GuardError('watchdog or cleanup uncertain')
+                  try:
+                      if _populated(_read(self.group_fd, 'cgroup.events')):
+                          raise GuardError('cgroup still populated')
+                      os.rmdir(self.name, dir_fd=self.parent_fd)
+                  except (OSError, UnicodeError) as exc:
+                      raise GuardError('cgroup removal uncertain') from exc
+                  finally:
+                      os.close(self.group_fd)
+                  return {'group_kill_observed_empty': True, 'group_removed': True,
+                          'engine_launch_authorized': False, 'isolation': 'not_verified'}
+          MODULE
+          cat > /tmp/astra-watchdog-host.py <<'HOST'
+          #!/usr/bin/python3
+          """Fixed synthetic watchdog cgroup exercise: ONLY a disposable private CI VM.
+          
+          The outer controller observes its own randomly created groups and synthetic
+          processes; no user content or genuine server. It keeps an independent cleanup
+          path even when the owner is SIGKILLed or the watchdog fails. Not a sandbox.
+          """
+          import json
+          import os
+          import select
+          import signal
+          import subprocess
+          import sys
+          import time
+          from pathlib import Path
+          
+          sys.path.insert(0, '/tmp/astra-watchdog-harness')
+          from devtools.cgroup_watchdog import create_guard, _read, _populated, _write, LIMITS
+          
+          CASES = ('normal', 'owner_kill', 'deadline', 'watchdog_kill')
+          
+          
+          def cgroup_parent():
+              if os.geteuid() != 0: raise RuntimeError('root_required')
+              lines = Path('/proc/self/cgroup').read_text().splitlines()
+              paths = [line[3:] for line in lines if line.startswith('0::/')]
+              if len(paths) != 1 or any(part in ('.', '..') for part in paths[0].split('/')):
+                  raise RuntimeError('membership_unusable')
+              return '/sys/fs/cgroup' + paths[0]
+          
+          
+          def synthetic_child():
+              # No fork or exec before the owner's explicit release. Not generic input.
+              if os.read(0, 1) != b'G': os._exit(10)
+              p = os.fork()
+              if p == 0:
+                  os.setsid()
+                  os.write(1, ('detached %d\n' % os.getpid()).encode())
+                  while True: time.sleep(1)
+              os.write(1, ('leader %d\n' % os.getpid()).encode())
+              while True: time.sleep(1)
+          
+          
+          def read_line(stream, seconds):
+              deadline = time.monotonic() + seconds
+              line = bytearray()
+              while time.monotonic() < deadline:
+                  ready, _, _ = select.select([stream], [], [], max(0, deadline-time.monotonic()))
+                  if not ready: break
+                  c = os.read(stream.fileno(), 1)
+                  if not c: break
+                  line.extend(c)
+                  if len(line) > 4096: raise RuntimeError('line_limit')
+                  if c == b'\n': return bytes(line).decode('ascii').strip()
+              raise RuntimeError('line_missing')
+          
+          
+          def owner(case):
+              fd = os.open(cgroup_parent(), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+              guard = None
+              child = None
+              try:
+                  guard = create_guard(fd, timeout=5 if case == 'deadline' else 20)
+                  # Tell the independent outer controller the exact created name/FD owner.
+                  print(json.dumps({'phase':'group', 'name':guard.name, 'watchdog':guard.child}), flush=True)
+                  if sys.stdin.readline() != 'ACK\n': raise RuntimeError('no_ack')
+                  # Pure fixed Python fixture; close_fds prevents owner-pipe inheritance.
+                  child = subprocess.Popen(['/usr/bin/python3', '-I', '/tmp/astra-watchdog-host.py', '--child'],
+                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                      close_fds=True, env={'PATH':'/usr/bin:/bin', 'LANG':'C'}, start_new_session=True)
+                  _write(guard.group_fd, 'cgroup.procs', str(child.pid))
+                  if str(child.pid) not in _read(guard.group_fd, 'cgroup.procs').split():
+                      raise RuntimeError('enrollment_missing')
+                  child.stdin.write(b'G'); child.stdin.flush(); child.stdin.close()
+                  markers = {}
+                  for _ in range(2):
+                      parts = read_line(child.stdout, 3).split()
+                      if len(parts) != 2 or parts[0] not in ('leader','detached') or not parts[1].isdigit():
+                          raise RuntimeError('invalid_marker')
+                      markers[parts[0]] = int(parts[1])
+                  members = _read(guard.group_fd, 'cgroup.procs').split()
+                  limits = {k:_read(guard.group_fd,k) for k in LIMITS}
+                  verified = (len(markers)==2 and markers['leader']==child.pid and
+                              markers['leader'] != markers['detached'] and
+                              all(str(pid) in members for pid in markers.values()) and
+                              os.getsid(markers['detached']) == markers['detached'] and
+                              _populated(_read(guard.group_fd,'cgroup.events')) and limits==LIMITS)
+                  print(json.dumps({'phase':'ready', 'members_observed':verified,
+                                    'markers':markers, 'limits':limits}), flush=True)
+                  if not verified: raise RuntimeError('membership_not_verified')
+                  if case == 'normal':
+                      if sys.stdin.readline() != 'FINISH\n': raise RuntimeError('no_finish')
+                      result = guard.finish()
+                      child.wait(timeout=2)
+                      print(json.dumps({'phase':'finished','result':result,'reaped':True}), flush=True)
+                      guard = None
+                      return 0
+                  if case == 'deadline':
+                      # Keep owner pipe open: only watchdog deadline should cause kill.
+                      child.wait(timeout=10)
+                      print(json.dumps({'phase':'deadline','reaped':True}), flush=True)
+                      result = guard.finish()
+                      print(json.dumps({'phase':'finished','result':result}), flush=True)
+                      guard = None
+                      return 0
+                  # Parent intentionally kills owner or watchdog after receiving ready.
+                  # Outer controller retains the command pipe. EOF is an emergency stop.
+                  if os.read(sys.stdin.fileno(), 1) != b'': raise RuntimeError('unexpected_outer_command')
+                  return 1
+              except Exception as e:
+                  print(json.dumps({'phase':'error','error':type(e).__name__+':'+str(e)[:100]}), flush=True)
+                  return 1
+              finally:
+                  if child is not None and child.poll() is None:
+                      child.kill(); child.wait(timeout=2)
+                  # On an owner error, trigger watchdog, but outer cleanup remains mandatory.
+                  if guard is not None:
+                      try: guard.finish()
+                      except Exception: pass
+                  os.close(fd)
+          
+          
+          def alive_non_zombie(pid):
+              try:
+                  text = Path('/proc/%d/stat' % pid).read_text()
+                  # comm in parentheses can contain spaces; state follows the final ')'.
+                  return text.rsplit(')',1)[1].split()[0] != 'Z'
+              except FileNotFoundError:
+                  return False
+          
+          
+          def outer_case(case, parent):
+              result = {'case':case, 'pass':False}
+              group_fd = None; name = None; owner_p = None
+              errors=[]
+              try:
+                  owner_p = subprocess.Popen(['/usr/bin/python3','-I','/tmp/astra-watchdog-host.py','--owner',case],
+                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                      env={'PATH':'/usr/bin:/bin','LANG':'C'}, close_fds=True, start_new_session=True)
+                  group = json.loads(read_line(owner_p.stdout, 5))
+                  name = group.get('name')
+                  if group.get('phase')!='group' or not isinstance(name,str) or len(name)!=43 or not name.startswith('astra-test-') or any(c not in '0123456789abcdef' for c in name[11:]):
+                      raise RuntimeError('invalid_group_identity')
+                  group_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+                  # A killed outer controller closes this pipe; owner must then refuse release.
+                  owner_p.stdin.write(b'ACK\n'); owner_p.stdin.flush()
+                  ready = json.loads(read_line(owner_p.stdout, 5))
+                  if ready.get('phase')!='ready' or ready.get('members_observed') is not True: raise RuntimeError('no_ready')
+                  pids = list(ready['markers'].values())
+                  # Independent actual live observations before the cleanup trigger.
+                  members = _read(group_fd, 'cgroup.procs').split()
+                  result['both_alive_before'] = len(pids)==2 and all(alive_non_zombie(pid) and str(pid) in members for pid in pids)
+                  result['resource_readback'] = {k:_read(group_fd,k) for k in LIMITS} == LIMITS
+                  result['distinct_session'] = os.getsid(ready['markers']['detached']) == ready['markers']['detached']
+                  if not all((result['both_alive_before'],result['resource_readback'],result['distinct_session'])):
+                      raise RuntimeError('pre_trigger_failed')
+                  if case == 'normal':
+                      owner_p.stdin.write(b'FINISH\n'); owner_p.stdin.flush()
+                      final = json.loads(read_line(owner_p.stdout, 8))
+                      result['owner_report'] = final.get('phase')=='finished' and final.get('reaped') is True and final.get('result',{}).get('group_removed') is True
+                      result['exit_ok'] = owner_p.wait(timeout=3)==0
+                  elif case == 'owner_kill':
+                      owner_p.kill(); result['exit_expected'] = owner_p.wait(timeout=3)==-signal.SIGKILL
+                  elif case == 'deadline':
+                      first = json.loads(read_line(owner_p.stdout, 9)); final = json.loads(read_line(owner_p.stdout, 5))
+                      result['deadline_report'] = first.get('phase')=='deadline' and final.get('phase')=='finished' and final.get('result',{}).get('group_removed') is True
+                      result['exit_ok'] = owner_p.wait(timeout=3)==0
+                  else:
+                      os.kill(group['watchdog'], signal.SIGKILL)
+                      # Demonstrate a broken watchdog does not clean up, before independent recovery.
+                      time.sleep(.15)
+                      result['watchdog_failure_observed'] = _populated(_read(group_fd,'cgroup.events')) and all(alive_non_zombie(p) for p in pids)
+                      owner_p.kill(); owner_p.wait(timeout=3)
+                      _write(group_fd,'cgroup.kill','1')
+                      result['outer_recovery_used'] = True
+                  if case in ('owner_kill','watchdog_kill'):
+                      deadline = time.monotonic()+5
+                      while _populated(_read(group_fd,'cgroup.events')) and time.monotonic()<deadline: time.sleep(.02)
+                      result['empty_observed'] = not _populated(_read(group_fd,'cgroup.events'))
+                      result['empty_source'] = 'outer_cgroup_events'
+                      os.rmdir(name,dir_fd=parent)
+                  else:
+                      # The owner has already removed the group; no event file is available.
+                      # This is its reported observation, not an independent outer reading.
+                      result['empty_observed'] = final.get('result',{}).get('group_kill_observed_empty') is True
+                      result['empty_source'] = 'owner_report'
+                  result['both_not_live_after'] = all(not alive_non_zombie(p) for p in pids)
+                  result['group_removed'] = not os.path.exists(os.path.join(cgroup_parent(),name))
+                  expected = {'normal':('owner_report','exit_ok'), 'owner_kill':('exit_expected',),
+                              'deadline':('deadline_report','exit_ok'),
+                              'watchdog_kill':('watchdog_failure_observed','outer_recovery_used')}[case]
+                  result['pass'] = all(result.get(k) is True for k in ('both_alive_before','resource_readback','distinct_session','empty_observed','both_not_live_after','group_removed')+expected)
+              except Exception as e:
+                  result['error'] = type(e).__name__+':'+str(e)[:120]
+              finally:
+                  if owner_p is not None and owner_p.poll() is None:
+                      owner_p.kill()
+                      try: owner_p.wait(timeout=3)
+                      except Exception: errors.append('owner_reap')
+                  if group_fd is not None and os.path.exists(os.path.join(cgroup_parent(),name)):
+                      try:
+                          _write(group_fd,'cgroup.kill','1')
+                          deadline = time.monotonic()+3
+                          while _populated(_read(group_fd,'cgroup.events')) and time.monotonic()<deadline: time.sleep(.02)
+                          if _populated(_read(group_fd,'cgroup.events')): errors.append('still_populated')
+                      except Exception as e: errors.append('kill:'+type(e).__name__)
+                      os.close(group_fd)
+                      try: os.rmdir(name,dir_fd=parent)
+                      except FileNotFoundError: pass
+                      except OSError: errors.append('remove')
+                  elif group_fd is not None:
+                      os.close(group_fd)
+                  result['cleanup_errors']=errors
+                  if errors: result['pass']=False
+              return result
+          
+          
+          def main():
+              if len(sys.argv)==2 and sys.argv[1]=='--child': synthetic_child(); return 1
+              if len(sys.argv)==3 and sys.argv[1]=='--owner' and sys.argv[2] in CASES: return owner(sys.argv[2])
+              if len(sys.argv)!=1: return 2
+              report={'synthetic_only':True,'engine_launch_authorized':False,'cases':[],'pass':False}
+              try:
+                  parent=os.open(cgroup_parent(),os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+                  try:
+                      for case in CASES:
+                          result=outer_case(case,parent); report['cases'].append(result)
+                          if not result['pass']: break
+                  finally: os.close(parent)
+                  report['pass']=len(report['cases'])==len(CASES) and all(r['pass'] for r in report['cases'])
+              except Exception as e: report['error']=type(e).__name__+':'+str(e)[:120]
+              print(json.dumps(report,sort_keys=True),flush=True)
+              return 0 if report['pass'] else 1
+          
+          if __name__=='__main__': sys.exit(main())
+          HOST
+          sha256sum /tmp/astra-watchdog-harness/devtools/cgroup_watchdog.py /tmp/astra-watchdog-host.py
+          sudo -n timeout --signal=TERM --kill-after=3s 55s env -i PATH=/usr/bin:/bin LANG=C /usr/bin/python3 -I /tmp/astra-watchdog-host.py
